@@ -1,0 +1,4 @@
+interface:
+  display_name: "BecaWork Logtime"
+  short_description: "Preview, submit, edit, and verify BecaWork logtime"
+  default_prompt: "Use $beca-logtime to preview yesterday's BecaWork logtime, then submit and verify it through the API."
