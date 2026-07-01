@@ -214,6 +214,56 @@ GET /api/Default/Work_GetLogtimeByWorkId?WorkFlowId={workId}
 
 For new rows, match by normalized `Ngay`, `SoGio`, `Mota`, current `Email`/`UserId` when present, and the submitted `Congviec`. If verification fails after POST, report `saved: true` and `verified: false`; do not silently claim success.
 
+## Daily Batch
+
+The daily command is a thin orchestration layer over the same read, validate, save, and verify endpoints. It does not use a persistent alias/cache as source of truth.
+
+Task resolution:
+
+1. Fetch active personal tasks with `Work_GetWorkInProcess`.
+2. Use `mine_only=true` client-side filtering and `rowNumber=200`.
+3. Resolve each entry task by exact `userWorkflowId` first.
+4. If not a work id, match by title with lowercase, whitespace normalization, and Vietnamese accent removal.
+5. Accept clear exact, substring, or fuzzy matches; block ambiguous/no-match cases and print top candidates.
+
+Entry format:
+
+```text
+TASK | HOURS | DESCRIPTION
+TASK | HOURS | DESCRIPTION | progress=VALUE
+```
+
+Batch validation before any save:
+
+- Sum all entry hours and require exactly `8`.
+- Call `Work_CheckOverInLogtime?newVal=8&oldVal=0&day={YYYY-MM-DD}&isCheckin=false`; block negative responses.
+- Prepare each logtime payload with the same add flow and run per-task duplicate checks.
+- Block duplicate work ids inside the same daily batch unless duplicate override was explicitly requested.
+
+Daily submit order:
+
+```text
+GET Work_GetWorkInProcess
+GET Work_CheckOverInLogtime(newVal=8, oldVal=0)
+prepare each entry with add validation and duplicate checks
+preview all entries once
+confirm once
+POST entry 1
+GET Work_GetLogtimeByWorkId for entry 1 verification
+optional PUT Work_UpdateJsonData for entry 1 progress
+POST entry 2
+GET Work_GetLogtimeByWorkId for entry 2 verification
+...
+```
+
+If a later entry fails after earlier entries saved, stop immediately, exit non-zero, and report saved/verified entries plus the failed entry. Do not continue mutating subsequent entries.
+
+Progress in daily:
+
+- `progress=VALUE` uses the same normalization and endpoint as `update-progress`.
+- Run progress update only after the corresponding logtime row has saved and verified.
+- Verify with `Work_DetailInfo.progress`.
+
 ## Update
 
 Frontend service mapping:
@@ -253,3 +303,71 @@ GET /api/Default/Work_GetLogtimeByWorkId?WorkFlowId={workId}
 ```
 
 For edited rows, match by `UserWorkflowId` plus normalized `Ngay`, `SoGio`, and `Mota`. Do not rely on the old database `Id`; BecaWork can assign a new `Id` after update while preserving `UserWorkflowId`.
+
+## Task Status And Progress
+
+Task-state updates are separate from logtime. Never update status or percent done as an automatic side effect of submitting logtime.
+
+Read task detail:
+
+```text
+GET /api/Default/Work_DetailInfo?workId={workId}
+```
+
+Important fields:
+
+- `userWorkflowId`: task/work id.
+- `projectId`, `projectName`
+- `status`: current status workflow id, for example `1330831`.
+- `statusName`: display name, for example `Open`.
+- `statusType`: status category, for example `Cơ bản`.
+- `progress`: percent done text, for example `28%`, `70%`, or `80`.
+
+List valid status transitions:
+
+```text
+GET /api/Default/Work_GetNextStatus?WorkId={workId}&projectId={projectId}&useForChild=false
+```
+
+Important status identifiers:
+
+- `id`: internal status row id, for example `9213`; do not use this for update.
+- `userWorkflowId`: status workflow id, for example `1330833`; use this as `statusId` in `Work_UpdateStatusWork`.
+- `isCurrentStatus`: marks the current task status.
+- `trangThaiCongViec`: status category; values such as `Hủy` should be blocked by default.
+
+Preflight status update:
+
+```text
+GET /api/Default/Work_CheckRuleUpdateProcessWork?workId={workId}
+GET /api/Default/Work_CheckBeforeSaveChangStatusWithFormExtendInfo?workId={workId}
+GET /api/Default/Work_CheckBeforeSaveChangStatus?workId={workId}&statusId={statusUserWorkflowId}
+```
+
+Treat empty string, `None`, and `null` as pass. Treat any other response text as a blocking validation message.
+
+Update status:
+
+```text
+GET /api/Default/Work_UpdateStatusWork?workId={workId}&statusId={statusUserWorkflowId}
+```
+
+This is a mutating GET used by the frontend. The CLI must preview, validate, and require explicit confirmation before calling it. Verify by re-reading `Work_DetailInfo` and matching `status` or `statusName`.
+
+Update percent done:
+
+```text
+PUT /api/Default/Work_UpdateJsonData?userWorkFlowId={workId}&fileName=Tiendo&value={percent}%
+Content-Type: application/json; charset=UTF-8
+Origin: https://work.becawork.vn
+Referer: https://work.becawork.vn/work/timesheet
+X-XSRF-TOKEN: {token}
+```
+
+Normalize user input:
+
+- `28` -> `28%`
+- `28%` -> `28%`
+- `28.5` -> `28.5%`
+
+Reject values below `0` or above `100`. Verify by re-reading `Work_DetailInfo.progress` and comparing normalized numeric values.

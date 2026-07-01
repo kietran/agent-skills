@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import getpass
 import html.parser
 import json
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from http.cookiejar import CookieJar
@@ -75,6 +77,47 @@ class PreparedLogtimeUpdate:
     over_logtime: Any
     duplicates: list[dict[str, Any]]
     old_value_for_validation: str
+
+
+@dataclass
+class PreparedStatusUpdate:
+    work_id: str
+    detail: dict[str, Any]
+    target: dict[str, Any]
+    validations: list[dict[str, Any]]
+
+
+@dataclass
+class PreparedProgressUpdate:
+    work_id: str
+    detail: dict[str, Any]
+    progress: str
+    validations: list[dict[str, Any]]
+
+
+@dataclass
+class DailyEntry:
+    raw: str
+    task_query: str
+    hours: str
+    description: str
+    progress: str | None = None
+
+
+@dataclass
+class PreparedDailyEntry:
+    entry: DailyEntry
+    task: dict[str, Any]
+    logtime: PreparedLogtime
+    progress: PreparedProgressUpdate | None = None
+
+
+@dataclass
+class PreparedDaily:
+    log_date: date
+    entries: list[PreparedDailyEntry]
+    batch_over_logtime: Any
+    total_hours: str
 
 
 class BecaClient:
@@ -433,6 +476,364 @@ def list_tasks(client: BecaClient, args: argparse.Namespace) -> list[dict[str, A
     if args.mine_only:
         tasks = [task for task in tasks if task.get("isMyWork") is True]
     return tasks
+
+
+def parse_daily_entry(raw: str) -> DailyEntry:
+    parts = [part.strip() for part in str(raw or "").split("|")]
+    if len(parts) not in {3, 4}:
+        raise BecaError('Daily entry must use: "task | hours | description [| progress=28]".')
+    task_query, hours_raw, description = parts[:3]
+    if not task_query:
+        raise BecaError("Daily entry task query is required.")
+    hours_number = number_or_none(hours_raw)
+    if hours_number is None or hours_number <= 0:
+        raise BecaError("Daily entry hours must be a positive number.")
+    if not description:
+        raise BecaError("Daily entry description is required.")
+    progress = None
+    if len(parts) == 4:
+        option = parts[3]
+        if not option.lower().startswith("progress="):
+            raise BecaError("Daily entry fourth field must be progress=VALUE.")
+        progress = normalize_progress_percent(option.split("=", 1)[1])
+    return DailyEntry(
+        raw=raw,
+        task_query=task_query,
+        hours=api_number_text(hours_number),
+        description=description,
+        progress=progress,
+    )
+
+
+def normalize_task_query(value: Any) -> str:
+    text = unicodedata.normalize("NFD", str(value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.replace("đ", "d").replace("Đ", "D").casefold()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def task_work_id(task: dict[str, Any]) -> str:
+    return first_text(task.get("userWorkflowId"), task.get("UserWorkflowId"), task.get("workId"))
+
+
+def task_project_id(task: dict[str, Any]) -> str:
+    return first_text(task.get("projectId"), task.get("ProjectId")).strip()
+
+
+def task_title(task: dict[str, Any]) -> str:
+    return first_text(task.get("title"), task.get("Title"))
+
+
+def daily_match_score(query: str, task: dict[str, Any]) -> float:
+    normalized_query = normalize_task_query(query)
+    normalized_title = normalize_task_query(task_title(task))
+    if not normalized_query or not normalized_title:
+        return 0.0
+    if normalized_query == normalized_title:
+        return 1.0
+    if normalized_query in normalized_title:
+        return 0.9 + min(len(normalized_query) / max(len(normalized_title), 1), 0.09)
+    if normalized_title in normalized_query:
+        return 0.88
+    return difflib.SequenceMatcher(None, normalized_query, normalized_title).ratio()
+
+
+def task_candidate_summary(task: dict[str, Any], score: float | None = None) -> dict[str, Any]:
+    summary = {
+        "projectId": task_project_id(task) or None,
+        "projectName": first_text(task.get("projectName"), task.get("ProjectName")) or None,
+        "workId": task_work_id(task) or None,
+        "title": task_title(task) or None,
+        "status": first_text(task.get("statusName"), task.get("StatusName")) or None,
+    }
+    if score is not None:
+        summary["score"] = round(score, 3)
+    return summary
+
+
+def daily_match_candidates(query: str, tasks: list[dict[str, Any]]) -> list[tuple[float, dict[str, Any]]]:
+    query_text = str(query or "").strip()
+    if query_text:
+        exact_id_matches = [(1.0, task) for task in tasks if task_work_id(task) == query_text]
+        if exact_id_matches:
+            return exact_id_matches
+    scored = [(daily_match_score(query, task), task) for task in tasks]
+    return sorted(scored, key=lambda item: item[0], reverse=True)
+
+
+def resolve_daily_task(query: str, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates = daily_match_candidates(query, tasks)
+    viable = [(score, task) for score, task in candidates if score >= 0.62]
+    if not viable:
+        suggestions = [task_candidate_summary(task, score) for score, task in candidates[:5]]
+        raise BecaError(f"Could not match daily task {query!r}. Candidates: {json.dumps(suggestions, ensure_ascii=False)}")
+
+    best_score, best_task = viable[0]
+    if len(viable) > 1:
+        second_score = viable[1][0]
+        if (best_score - second_score) < 0.12:
+            suggestions = [task_candidate_summary(task, score) for score, task in viable[:5]]
+            raise BecaError(f"Ambiguous daily task {query!r}. Candidates: {json.dumps(suggestions, ensure_ascii=False)}")
+    return best_task
+
+
+def daily_task_list_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        title="",
+        project_name="",
+        type="Xử lý",
+        page=1,
+        rows=200,
+        mine_only=True,
+    )
+
+
+def daily_logtime_args(args: argparse.Namespace, entry: DailyEntry, task: dict[str, Any]) -> argparse.Namespace:
+    return argparse.Namespace(
+        project_id=task_project_id(task),
+        work_id=task_work_id(task),
+        date=args.date,
+        hours=entry.hours,
+        action="Thực hiện",
+        description=entry.description,
+        allow_duplicate=args.allow_duplicate,
+    )
+
+
+def daily_progress_args(entry: DailyEntry, task: dict[str, Any]) -> argparse.Namespace:
+    return argparse.Namespace(
+        work_id=task_work_id(task),
+        progress=entry.progress,
+    )
+
+
+def prepare_daily(client: BecaClient, args: argparse.Namespace) -> PreparedDaily:
+    if not args.entry:
+        raise BecaError("Pass at least one --entry.")
+    entries = [parse_daily_entry(raw) for raw in args.entry]
+    total_number = sum(number_or_none(entry.hours) or 0 for entry in entries)
+    if abs(total_number - 8.0) > 0.000001:
+        raise BecaError(f"Daily total hours must be exactly 8; got {total_number:g}.")
+
+    log_date = parse_log_date(args.date)
+    batch_over_logtime = response_data(check_over_logtime(client, log_date, "8", "0"))
+    batch_over_number = number_or_none(batch_over_logtime)
+    if batch_over_number is None:
+        raise BecaError(f"Unexpected daily over-logtime validation response: {batch_over_logtime!r}")
+    if batch_over_number < 0:
+        raise BecaError(f"Daily over-logtime validation failed: {batch_over_logtime}")
+
+    tasks = list_tasks(client, daily_task_list_args())
+    if not tasks:
+        raise BecaError("No active personal tasks found.")
+
+    prepared_entries: list[PreparedDailyEntry] = []
+    seen_work_ids: set[str] = set()
+    for entry in entries:
+        task = resolve_daily_task(entry.task_query, tasks)
+        work_id = task_work_id(task)
+        if not work_id:
+            raise BecaError(f"Matched task for {entry.task_query!r} did not include work id.")
+        if not task_project_id(task):
+            raise BecaError(f"Matched task for {entry.task_query!r} did not include project id.")
+        if work_id in seen_work_ids and not args.allow_duplicate:
+            raise BecaError(f"Daily contains duplicate entry for work {work_id}.")
+        seen_work_ids.add(work_id)
+
+        logtime = prepare_logtime(client, daily_logtime_args(args, entry, task))
+        progress = prepare_progress_update(client, daily_progress_args(entry, task)) if entry.progress else None
+        prepared_entries.append(
+            PreparedDailyEntry(
+                entry=entry,
+                task=task,
+                logtime=logtime,
+                progress=progress,
+            )
+        )
+
+    return PreparedDaily(
+        log_date=log_date,
+        entries=prepared_entries,
+        batch_over_logtime=batch_over_logtime,
+        total_hours=api_number_text(total_number),
+    )
+
+
+def get_task_detail(client: BecaClient, work_id: str) -> dict[str, Any]:
+    data = response_data(client.get_json("/api/Default/Work_DetailInfo", {"workId": work_id}))
+    if not isinstance(data, dict):
+        raise BecaError("Unexpected Work_DetailInfo response.")
+    if not first_text(data.get("userWorkflowId"), data.get("UserWorkflowId")):
+        data["userWorkflowId"] = str(work_id)
+    return data
+
+
+def get_next_statuses(client: BecaClient, work_id: str, project_id: str) -> list[dict[str, Any]]:
+    data = response_data(
+        client.get_json(
+            "/api/Default/Work_GetNextStatus",
+            {"WorkId": work_id, "projectId": project_id, "useForChild": "false"},
+        )
+    )
+    if not isinstance(data, list):
+        raise BecaError("Unexpected Work_GetNextStatus response.")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def status_workflow_id(status: dict[str, Any]) -> str:
+    return first_text(status.get("userWorkflowId"), status.get("UserWorkflowId"))
+
+
+def status_name(status: dict[str, Any]) -> str:
+    return first_text(status.get("name"), status.get("Name"))
+
+
+def status_kind(status: dict[str, Any]) -> str:
+    return first_text(status.get("trangThaiCongViec"), status.get("statusType"))
+
+
+def normalized_lookup_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def resolve_status_target(
+    statuses: list[dict[str, Any]],
+    status: str | None,
+    status_id: str | None,
+) -> dict[str, Any]:
+    if bool(status) == bool(status_id):
+        raise BecaError("Pass exactly one of --status or --status-id.")
+    if status_id:
+        target_id = str(status_id).strip()
+        for item in statuses:
+            if target_id in {
+                status_workflow_id(item),
+                first_text(item.get("id"), item.get("Id")),
+                first_text(item.get("theSameId")),
+            }:
+                return item
+        raise BecaError(f"Status id {target_id} is not available for this work.")
+
+    target_name = normalized_lookup_text(status)
+    matches = [item for item in statuses if normalized_lookup_text(status_name(item)) == target_name]
+    if not matches:
+        raise BecaError(f"Status {status!r} is not available for this work.")
+    if len(matches) > 1:
+        ids = ", ".join(status_workflow_id(item) or first_text(item.get("id")) for item in matches)
+        raise BecaError(f"Status {status!r} matched multiple options; pass --status-id. Candidates: {ids}")
+    return matches[0]
+
+
+def is_cancel_status(status: dict[str, Any]) -> bool:
+    name = normalized_lookup_text(status_name(status))
+    kind = normalized_lookup_text(status_kind(status))
+    return name in {"pending", "reject"} or kind in {"hủy", "huy"}
+
+
+def guard_message(value: Any) -> str:
+    data = response_data(value)
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        text = data.strip()
+        return "" if text.casefold() in {"", "none", "null"} else text
+    if isinstance(data, (list, dict)) and not data:
+        return ""
+    return str(data)
+
+
+def run_task_update_guard(client: BecaClient, work_id: str) -> dict[str, Any]:
+    value = client.get_json("/api/Default/Work_CheckRuleUpdateProcessWork", {"workId": work_id})
+    message = guard_message(value)
+    result = {"name": "Work_CheckRuleUpdateProcessWork", "message": message}
+    if message:
+        raise BecaError(f"Task update rule failed: {message}")
+    return result
+
+
+def run_status_guards(client: BecaClient, work_id: str, status_id: str) -> list[dict[str, Any]]:
+    validations = [run_task_update_guard(client, work_id)]
+    form_extend = client.get_json(
+        "/api/Default/Work_CheckBeforeSaveChangStatusWithFormExtendInfo",
+        {"workId": work_id},
+    )
+    form_extend_message = guard_message(form_extend)
+    validations.append(
+        {
+            "name": "Work_CheckBeforeSaveChangStatusWithFormExtendInfo",
+            "message": form_extend_message,
+        }
+    )
+    if form_extend_message:
+        raise BecaError(f"Status form-extend validation failed: {form_extend_message}")
+
+    status_check = client.get_json(
+        "/api/Default/Work_CheckBeforeSaveChangStatus",
+        {"workId": work_id, "statusId": status_id},
+    )
+    status_message = guard_message(status_check)
+    validations.append(
+        {
+            "name": "Work_CheckBeforeSaveChangStatus",
+            "statusId": status_id,
+            "message": status_message,
+        }
+    )
+    if status_message:
+        raise BecaError(f"Status validation failed: {status_message}")
+    return validations
+
+
+def prepare_status_update(client: BecaClient, args: argparse.Namespace) -> PreparedStatusUpdate:
+    work_id = str(args.work_id).strip()
+    detail = get_task_detail(client, work_id)
+    project_id = first_text(detail.get("projectId"), detail.get("ProjectId"))
+    if not project_id:
+        raise BecaError("Task detail response did not include projectId.")
+    statuses = get_next_statuses(client, work_id, project_id)
+    target = resolve_status_target(statuses, getattr(args, "status", None), getattr(args, "status_id", None))
+    target_status_id = status_workflow_id(target)
+    if not target_status_id:
+        raise BecaError("Target status did not include userWorkflowId.")
+    if is_cancel_status(target) and not getattr(args, "allow_cancel", False):
+        raise BecaError("Pending/Reject/cancel statuses are blocked by default. Pass --allow-cancel to override.")
+    validations = run_status_guards(client, work_id, target_status_id)
+    return PreparedStatusUpdate(work_id=work_id, detail=detail, target=target, validations=validations)
+
+
+def normalize_progress_percent(value: Any) -> str:
+    text = str(value or "").strip().replace(",", ".")
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    number = number_or_none(text)
+    if number is None:
+        raise BecaError("--progress must be a number from 0 to 100.")
+    if number < 0 or number > 100:
+        raise BecaError("--progress must be between 0 and 100.")
+    normalized = str(int(number)) if number.is_integer() else f"{number:g}"
+    return f"{normalized}%"
+
+
+def progress_number(value: Any) -> float | None:
+    text = str(value or "").strip().replace(",", ".")
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    return number_or_none(text)
+
+
+def progress_matches(current: Any, expected: Any) -> bool:
+    left = progress_number(current)
+    right = progress_number(expected)
+    return left is not None and right is not None and abs(left - right) < 0.000001
+
+
+def prepare_progress_update(client: BecaClient, args: argparse.Namespace) -> PreparedProgressUpdate:
+    work_id = str(args.work_id).strip()
+    detail = get_task_detail(client, work_id)
+    progress = normalize_progress_percent(args.progress)
+    validations = [run_task_update_guard(client, work_id)]
+    return PreparedProgressUpdate(work_id=work_id, detail=detail, progress=progress, validations=validations)
 
 
 def get_api_setting(client: BecaClient) -> tuple[str, str]:
@@ -1076,6 +1477,310 @@ def render_save_result_text(result: dict[str, Any]) -> str:
     return "\n".join([header, render_verification_text(result["postVerify"])])
 
 
+def daily_entry_preview_dict(prepared: PreparedDailyEntry) -> dict[str, Any]:
+    logtime_preview = preview_dict(prepared.logtime)
+    values = logtime_preview["values"]
+    return {
+        "taskQuery": prepared.entry.task_query,
+        "resolvedTask": task_candidate_summary(prepared.task),
+        "date": normalize_date_value(values.get("Ngay")),
+        "hours": api_number_text(values.get("SoGio")),
+        "description": plain_text_description(values.get("Mota")),
+        "action": values.get("Hanhdong"),
+        "overLogtime": logtime_preview.get("overLogtime"),
+        "duplicates": logtime_preview.get("duplicates", []),
+        "progress": progress_preview_dict(prepared.progress) if prepared.progress else None,
+        "logtime": logtime_preview,
+    }
+
+
+def daily_preview_dict(prepared: PreparedDaily) -> dict[str, Any]:
+    return {
+        "date": prepared.log_date.isoformat(),
+        "totalHours": prepared.total_hours,
+        "batchOverLogtime": {"remainingAfterBatch": prepared.batch_over_logtime},
+        "entries": [daily_entry_preview_dict(item) for item in prepared.entries],
+    }
+
+
+def render_daily_preview_text(preview: dict[str, Any]) -> str:
+    lines = [
+        "Preview daily logtime",
+        f"- Ngày log: {display_value(preview.get('date'))}",
+        f"- Tổng giờ: {display_value(api_number_text(preview.get('totalHours')))}",
+        f"- Validate ngày: {status_text(preview.get('batchOverLogtime', {}).get('remainingAfterBatch'))}",
+        f"- Số dòng: {len(preview.get('entries', []))}",
+    ]
+    for index, entry in enumerate(preview.get("entries", []), start=1):
+        task = entry.get("resolvedTask", {})
+        lines.extend(
+            [
+                "",
+                f"{index}. {display_value(task.get('title'))}",
+                f"   Work ID: {display_value(task.get('workId'))} | Project ID: {display_value(task.get('projectId'))}",
+                f"   Project: {display_value(task.get('projectName'))}",
+                f"   Giờ: {display_value(api_number_text(entry.get('hours')))}",
+                f"   Nội dung: {display_value(entry.get('description'))}",
+                f"   Validate dòng: {status_text(entry.get('overLogtime', {}).get('remainingAfterEntry'))}",
+            ]
+        )
+        progress = entry.get("progress")
+        if progress:
+            lines.append(f"   Progress sau log: {display_value(progress.get('target', {}).get('progress'))}")
+        lines.extend(f"   {line}" for line in render_duplicate_summary(entry.get("duplicates", [])))
+    return "\n".join(lines)
+
+
+def daily_result_entry_dict(
+    prepared: PreparedDailyEntry,
+    logtime_result: dict[str, Any] | None = None,
+    progress_result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "taskQuery": prepared.entry.task_query,
+        "resolvedTask": task_candidate_summary(prepared.task),
+        "hours": prepared.entry.hours,
+        "description": prepared.entry.description,
+        "logtime": logtime_result,
+        "progress": progress_result,
+        "error": error,
+    }
+
+
+def daily_result_dict(
+    prepared: PreparedDaily,
+    entries: list[dict[str, Any]],
+    failed_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    complete = failed_entry is None and len(entries) == len(prepared.entries)
+    verified = complete and all(
+        bool((entry.get("logtime") or {}).get("verified"))
+        and (entry.get("progress") is None or bool(entry["progress"].get("verified")))
+        for entry in entries
+    )
+    return {
+        "saved": any(bool((entry.get("logtime") or {}).get("saved")) for entry in entries),
+        "complete": complete,
+        "verified": verified,
+        "date": prepared.log_date.isoformat(),
+        "totalHours": prepared.total_hours,
+        "entries": entries,
+        "failedEntry": failed_entry,
+    }
+
+
+def render_daily_result_text(result: dict[str, Any]) -> str:
+    header = "Đã ghi daily logtime." if result.get("complete") else "Daily logtime chưa hoàn tất."
+    lines = [
+        header,
+        f"- Ngày log: {display_value(result.get('date'))}",
+        f"- Tổng giờ: {display_value(api_number_text(result.get('totalHours')))}",
+        f"- API verify toàn batch: {'Thành công' if result.get('verified') else 'Chưa xác nhận đủ'}",
+    ]
+    for index, entry in enumerate(result.get("entries", []), start=1):
+        task = entry.get("resolvedTask", {})
+        logtime = entry.get("logtime") or {}
+        logtime_row = logtime.get("logtime") or {}
+        progress = entry.get("progress")
+        lines.extend(
+            [
+                "",
+                f"{index}. {display_value(task.get('title'))}",
+                f"   Work ID: {display_value(task.get('workId'))} | Project ID: {display_value(task.get('projectId'))}",
+                f"   Giờ: {display_value(api_number_text(entry.get('hours')))}",
+                f"   Nội dung: {display_value(entry.get('description'))}",
+                f"   Logtime verify: {'Thành công' if logtime.get('verified') else 'Chưa xác nhận được'}",
+                f"   Log ID: {display_value(logtime_row.get('matchedLogId'))} | Log UserWorkflowId: {display_value(logtime_row.get('logUserWorkflowId'))}",
+            ]
+        )
+        if progress:
+            lines.append(f"   Progress verify: {'Thành công' if progress.get('verified') else 'Chưa xác nhận được'}")
+    failed = result.get("failedEntry")
+    if failed:
+        task = failed.get("resolvedTask", {})
+        lines.extend(
+            [
+                "",
+                "Dừng ở dòng lỗi:",
+                f"- Task: {display_value(task.get('title'))}",
+                f"- Work ID: {display_value(task.get('workId'))}",
+                f"- Lỗi: {display_value(failed.get('error'))}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def task_summary(detail: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "workId": first_text(detail.get("userWorkflowId"), detail.get("UserWorkflowId")) or None,
+        "title": first_text(detail.get("title"), detail.get("Title")) or None,
+        "projectId": first_text(detail.get("projectId"), detail.get("ProjectId")) or None,
+        "projectName": first_text(detail.get("projectName"), detail.get("ProjectName")) or None,
+        "statusId": first_text(detail.get("status"), detail.get("Status")) or None,
+        "statusName": first_text(detail.get("statusName"), detail.get("StatusName")) or None,
+        "statusType": first_text(detail.get("statusType"), detail.get("StatusType")) or None,
+        "progress": first_text(detail.get("progress"), detail.get("Progress")) or None,
+        "createdBy": first_text(detail.get("createdBy"), detail.get("CreatedBy")) or None,
+        "userExecStatus": first_text(detail.get("userExecStatus"), detail.get("UserExecStatus")) or None,
+        "dateExec": first_text(detail.get("dateExec"), detail.get("DateExec")) or None,
+    }
+
+
+def status_summary(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": first_text(status.get("id"), status.get("Id")) or None,
+        "name": status_name(status) or None,
+        "projectId": first_text(status.get("projectId"), status.get("ProjectId")) or None,
+        "userWorkflowId": status_workflow_id(status) or None,
+        "kind": status_kind(status) or None,
+        "isCurrentStatus": bool(status.get("isCurrentStatus")),
+        "userUpdateStatus": first_text(status.get("userUpdateStatus")) or None,
+        "theSameId": first_text(status.get("theSameId")) or None,
+        "blockedByDefault": is_cancel_status(status),
+    }
+
+
+def status_preview_dict(prepared: PreparedStatusUpdate) -> dict[str, Any]:
+    return {
+        "workId": prepared.work_id,
+        "current": task_summary(prepared.detail),
+        "target": status_summary(prepared.target),
+        "validations": prepared.validations,
+        "update": {
+            "method": "GET",
+            "url": f"{WORK_ORIGIN}/api/Default/Work_UpdateStatusWork",
+            "params": {
+                "workId": prepared.work_id,
+                "statusId": status_workflow_id(prepared.target),
+            },
+        },
+    }
+
+
+def progress_preview_dict(prepared: PreparedProgressUpdate) -> dict[str, Any]:
+    current = task_summary(prepared.detail)
+    return {
+        "workId": prepared.work_id,
+        "current": current,
+        "target": {"progress": prepared.progress},
+        "validations": prepared.validations,
+        "update": {
+            "method": "PUT",
+            "url": f"{WORK_ORIGIN}/api/Default/Work_UpdateJsonData",
+            "params": {
+                "userWorkFlowId": prepared.work_id,
+                "fileName": "Tiendo",
+                "value": prepared.progress,
+            },
+        },
+    }
+
+
+def task_state_result_dict(
+    operation: str,
+    response: Any,
+    preview: dict[str, Any],
+    verified_detail: dict[str, Any],
+    verified: bool,
+) -> dict[str, Any]:
+    return {
+        "updated": True,
+        "operation": operation,
+        "verified": verified,
+        "workId": preview["workId"],
+        "current": preview["current"],
+        "target": preview["target"],
+        "verifiedTask": task_summary(verified_detail),
+        "response": compact_response(response),
+    }
+
+
+def render_task_text(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "Task BecaWork",
+            f"- Task: {display_value(summary.get('title'))}",
+            f"- Work ID: {display_value(summary.get('workId'))}",
+            f"- Project: {display_value(summary.get('projectName'))}",
+            f"- Project ID: {display_value(summary.get('projectId'))}",
+            f"- Status: {display_value(summary.get('statusName'))} ({display_value(summary.get('statusId'))})",
+            f"- Status type: {display_value(summary.get('statusType'))}",
+            f"- Progress: {display_value(summary.get('progress'))}",
+            f"- Created by: {display_value(summary.get('createdBy'))}",
+            f"- User exec status: {display_value(summary.get('userExecStatus'))}",
+            f"- Date exec: {display_value(summary.get('dateExec'))}",
+        ]
+    )
+
+
+def render_statuses_text(statuses: list[dict[str, Any]]) -> str:
+    lines = [f"{'STATUS ID':<12} {'CURRENT':<7} {'BLOCK':<7} {'KIND':<24} NAME"]
+    for item in statuses:
+        row = status_summary(item)
+        lines.append(
+            f"{display_value(row.get('userWorkflowId')):<12} "
+            f"{str(row.get('isCurrentStatus')):<7} "
+            f"{str(row.get('blockedByDefault')):<7} "
+            f"{display_value(row.get('kind')):<24} "
+            f"{display_value(row.get('name'))}"
+        )
+    return "\n".join(lines)
+
+
+def render_preview_status_text(preview: dict[str, Any]) -> str:
+    current = preview["current"]
+    target = preview["target"]
+    lines = [
+        "Preview đổi status task",
+        f"- Task: {display_value(current.get('title'))}",
+        f"- Work ID: {display_value(preview.get('workId'))}",
+        f"- Project: {display_value(current.get('projectName'))}",
+        f"- Status hiện tại: {display_value(current.get('statusName'))} ({display_value(current.get('statusId'))})",
+        f"- Status mới: {display_value(target.get('name'))} ({display_value(target.get('userWorkflowId'))})",
+        f"- Loại status mới: {display_value(target.get('kind'))}",
+    ]
+    for validation in preview.get("validations", []):
+        lines.append(f"- {validation.get('name')}: OK")
+    return "\n".join(lines)
+
+
+def render_preview_progress_text(preview: dict[str, Any]) -> str:
+    current = preview["current"]
+    target = preview["target"]
+    lines = [
+        "Preview đổi % done task",
+        f"- Task: {display_value(current.get('title'))}",
+        f"- Work ID: {display_value(preview.get('workId'))}",
+        f"- Project: {display_value(current.get('projectName'))}",
+        f"- Progress hiện tại: {display_value(current.get('progress'))}",
+        f"- Progress mới: {display_value(target.get('progress'))}",
+    ]
+    for validation in preview.get("validations", []):
+        lines.append(f"- {validation.get('name')}: OK")
+    return "\n".join(lines)
+
+
+def render_task_state_result_text(result: dict[str, Any]) -> str:
+    target = result.get("target", {})
+    verified_task = result.get("verifiedTask", {})
+    if result.get("operation") == "update-status":
+        target_text = f"{display_value(target.get('name'))} ({display_value(target.get('userWorkflowId'))})"
+        verified_text = f"{display_value(verified_task.get('statusName'))} ({display_value(verified_task.get('statusId'))})"
+    else:
+        target_text = display_value(target.get("progress"))
+        verified_text = display_value(verified_task.get("progress"))
+    return "\n".join(
+        [
+            "Đã cập nhật task.",
+            f"- Work ID: {display_value(result.get('workId'))}",
+            f"- Target: {target_text}",
+            f"- API verify: {'Thành công' if result.get('verified') else 'Chưa xác nhận được'}",
+            f"- Giá trị hiện tại sau update: {verified_text}",
+        ]
+    )
+
+
 def print_tasks(tasks: list[dict[str, Any]], as_json: bool) -> None:
     rows = [
         {
@@ -1163,6 +1868,77 @@ def command_submit(client: BecaClient, args: argparse.Namespace) -> int:
     return 0 if verification["verified"] else 2
 
 
+def apply_progress_update(client: BecaClient, prepared: PreparedProgressUpdate) -> dict[str, Any]:
+    preview = progress_preview_dict(prepared)
+    response = client.put_json(
+        "/api/Default/Work_UpdateJsonData",
+        {},
+        {
+            "userWorkFlowId": prepared.work_id,
+            "fileName": "Tiendo",
+            "value": prepared.progress,
+        },
+    )
+    verified_detail = get_task_detail(client, prepared.work_id)
+    verified = progress_matches(task_summary(verified_detail).get("progress"), prepared.progress)
+    return task_state_result_dict("update-progress", response, preview, verified_detail, verified)
+
+
+def command_daily(client: BecaClient, args: argparse.Namespace) -> int:
+    prepared = prepare_daily(client, args)
+    preview = daily_preview_dict(prepared)
+    print_json(preview) if getattr(args, "json", False) else print(render_daily_preview_text(preview))
+    if not args.yes:
+        confirmation = input("Save this BecaWork daily logtime batch? [y/N]: ").strip().lower()
+        if confirmation not in {"y", "yes", "submit"}:
+            raise BecaError("Daily submission cancelled.")
+
+    results: list[dict[str, Any]] = []
+    for item in prepared.entries:
+        try:
+            response = client.post_json(item.logtime.save_url, item.logtime.payload)
+            verification = verify_saved_logtime(
+                client,
+                "submit",
+                values_from_payload(item.logtime.payload),
+            )
+            logtime_result = save_result_dict("submit", response, verification)
+            entry_result = daily_result_entry_dict(item, logtime_result=logtime_result)
+            results.append(entry_result)
+            if not verification["verified"]:
+                failed = daily_result_entry_dict(
+                    item,
+                    logtime_result=logtime_result,
+                    error="Saved, but API verification did not find the new logtime row.",
+                )
+                result = daily_result_dict(prepared, results, failed_entry=failed)
+                print_json(result) if getattr(args, "json", False) else print(render_daily_result_text(result))
+                return 2
+
+            if item.progress:
+                progress_result = apply_progress_update(client, item.progress)
+                entry_result["progress"] = progress_result
+                if not progress_result["verified"]:
+                    failed = daily_result_entry_dict(
+                        item,
+                        logtime_result=logtime_result,
+                        progress_result=progress_result,
+                        error="Progress update saved, but API verification did not match the target value.",
+                    )
+                    result = daily_result_dict(prepared, results, failed_entry=failed)
+                    print_json(result) if getattr(args, "json", False) else print(render_daily_result_text(result))
+                    return 2
+        except BecaError as exc:
+            failed = daily_result_entry_dict(item, error=str(exc))
+            result = daily_result_dict(prepared, results, failed_entry=failed)
+            print_json(result) if getattr(args, "json", False) else print(render_daily_result_text(result))
+            return 2
+
+    result = daily_result_dict(prepared, results)
+    print_json(result) if getattr(args, "json", False) else print(render_daily_result_text(result))
+    return 0 if result["verified"] else 2
+
+
 def command_update(client: BecaClient, args: argparse.Namespace) -> int:
     prepared = prepare_update_logtime(client, args)
     preview = preview_update_dict(prepared)
@@ -1205,6 +1981,74 @@ def command_verify_logtime(client: BecaClient, args: argparse.Namespace) -> int:
     return 0 if verification["verified"] else 2
 
 
+def command_get_task(client: BecaClient, args: argparse.Namespace) -> int:
+    summary = task_summary(get_task_detail(client, str(args.work_id)))
+    print_json(summary) if getattr(args, "json", False) else print(render_task_text(summary))
+    return 0
+
+
+def command_list_statuses(client: BecaClient, args: argparse.Namespace) -> int:
+    detail = get_task_detail(client, str(args.work_id))
+    project_id = first_text(detail.get("projectId"), detail.get("ProjectId"))
+    if not project_id:
+        raise BecaError("Task detail response did not include projectId.")
+    statuses = get_next_statuses(client, str(args.work_id), project_id)
+    rows = [status_summary(item) for item in statuses]
+    print_json(rows) if getattr(args, "json", False) else print(render_statuses_text(statuses))
+    return 0
+
+
+def command_preview_status(client: BecaClient, args: argparse.Namespace) -> int:
+    prepared = prepare_status_update(client, args)
+    preview = status_preview_dict(prepared)
+    print_json(preview) if getattr(args, "json", False) else print(render_preview_status_text(preview))
+    return 0
+
+
+def command_update_status(client: BecaClient, args: argparse.Namespace) -> int:
+    prepared = prepare_status_update(client, args)
+    preview = status_preview_dict(prepared)
+    print_json(preview) if getattr(args, "json", False) else print(render_preview_status_text(preview))
+    if not args.yes:
+        confirmation = input("Type UPDATE to change this BecaWork task status: ").strip()
+        if confirmation != "UPDATE":
+            raise BecaError("Status update cancelled.")
+    target_status_id = status_workflow_id(prepared.target)
+    response = client.get_json(
+        "/api/Default/Work_UpdateStatusWork",
+        {"workId": prepared.work_id, "statusId": target_status_id},
+    )
+    verified_detail = get_task_detail(client, prepared.work_id)
+    verified_summary = task_summary(verified_detail)
+    verified = (
+        verified_summary.get("statusId") == target_status_id
+        or normalized_lookup_text(verified_summary.get("statusName")) == normalized_lookup_text(status_name(prepared.target))
+    )
+    result = task_state_result_dict("update-status", response, preview, verified_detail, verified)
+    print_json(result) if getattr(args, "json", False) else print(render_task_state_result_text(result))
+    return 0 if verified else 2
+
+
+def command_preview_progress(client: BecaClient, args: argparse.Namespace) -> int:
+    prepared = prepare_progress_update(client, args)
+    preview = progress_preview_dict(prepared)
+    print_json(preview) if getattr(args, "json", False) else print(render_preview_progress_text(preview))
+    return 0
+
+
+def command_update_progress(client: BecaClient, args: argparse.Namespace) -> int:
+    prepared = prepare_progress_update(client, args)
+    preview = progress_preview_dict(prepared)
+    print_json(preview) if getattr(args, "json", False) else print(render_preview_progress_text(preview))
+    if not args.yes:
+        confirmation = input("Type UPDATE to change this BecaWork task progress: ").strip()
+        if confirmation != "UPDATE":
+            raise BecaError("Progress update cancelled.")
+    result = apply_progress_update(client, prepared)
+    print_json(result) if getattr(args, "json", False) else print(render_task_state_result_text(result))
+    return 0 if result["verified"] else 2
+
+
 def add_common_logtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--work-id", required=True)
@@ -1233,8 +2077,21 @@ def add_verify_logtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--description")
 
 
+def add_status_target_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--work-id", required=True)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--status", help="Target status name from Work_GetNextStatus, e.g. In Progress")
+    target.add_argument("--status-id", help="Target status userWorkflowId from Work_GetNextStatus")
+    parser.add_argument("--allow-cancel", action="store_true", help="Allow Pending/Reject/cancel statuses")
+
+
+def add_progress_target_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--work-id", required=True)
+    parser.add_argument("--progress", required=True, help="Percent complete, e.g. 28 or 28%%")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Preview, submit, and update BecaWork logtime.")
+    parser = argparse.ArgumentParser(description="Preview, submit, update, and verify BecaWork logtime/task state.")
     parser.add_argument("--cookie", default=os.getenv("BECA_COOKIE"), help="BecaWork cookie header value")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1270,6 +2127,19 @@ def build_parser() -> argparse.ArgumentParser:
     submit_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
     submit_parser.set_defaults(func=command_submit)
 
+    daily_parser = subparsers.add_parser("daily", help="Submit a full 8h daily logtime batch after one preview")
+    daily_parser.add_argument(
+        "--entry",
+        action="append",
+        default=[],
+        help='Use "task query | hours | description [| progress=28]"',
+    )
+    daily_parser.add_argument("--date", help="YYYY-MM-DD; defaults to previous business day")
+    daily_parser.add_argument("--allow-duplicate", action="store_true")
+    daily_parser.add_argument("--yes", action="store_true", help="Skip prompt only when the user explicitly requested submit")
+    daily_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
+    daily_parser.set_defaults(func=command_daily)
+
     preview_update_parser = subparsers.add_parser("preview-update", help="Build and validate an existing logtime edit")
     add_update_logtime_args(preview_update_parser)
     preview_update_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
@@ -1285,6 +2155,38 @@ def build_parser() -> argparse.ArgumentParser:
     add_verify_logtime_args(verify_parser)
     verify_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
     verify_parser.set_defaults(func=command_verify_logtime)
+
+    get_task_parser = subparsers.add_parser("get-task", help="Read one BecaWork task by work id")
+    get_task_parser.add_argument("--work-id", required=True)
+    get_task_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
+    get_task_parser.set_defaults(func=command_get_task)
+
+    statuses_parser = subparsers.add_parser("list-statuses", help="List current and next task statuses")
+    statuses_parser.add_argument("--work-id", required=True)
+    statuses_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
+    statuses_parser.set_defaults(func=command_list_statuses)
+
+    preview_status_parser = subparsers.add_parser("preview-status", help="Preview and validate a task status change")
+    add_status_target_args(preview_status_parser)
+    preview_status_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
+    preview_status_parser.set_defaults(func=command_preview_status)
+
+    update_status_parser = subparsers.add_parser("update-status", help="Update a task status after explicit confirmation")
+    add_status_target_args(update_status_parser)
+    update_status_parser.add_argument("--yes", action="store_true", help="Skip prompt only when the user explicitly requested update")
+    update_status_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
+    update_status_parser.set_defaults(func=command_update_status)
+
+    preview_progress_parser = subparsers.add_parser("preview-progress", help="Preview and validate a task progress change")
+    add_progress_target_args(preview_progress_parser)
+    preview_progress_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
+    preview_progress_parser.set_defaults(func=command_preview_progress)
+
+    update_progress_parser = subparsers.add_parser("update-progress", help="Update task percent complete after explicit confirmation")
+    add_progress_target_args(update_progress_parser)
+    update_progress_parser.add_argument("--yes", action="store_true", help="Skip prompt only when the user explicitly requested update")
+    update_progress_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of review text")
+    update_progress_parser.set_defaults(func=command_update_progress)
 
     return parser
 
