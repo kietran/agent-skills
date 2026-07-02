@@ -1,0 +1,4 @@
+interface:
+  display_name: "IEA/AIE Slide Imagegen"
+  short_description: "Create academic slide images from a template"
+  default_prompt: "Use $iea-aie-slide-imagegen to turn my paper and slide outline into 16:9 PNG slide images in the referenced academic style."
