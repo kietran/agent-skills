@@ -1,0 +1,6 @@
+interface:
+  display_name: "Build Review Artifacts"
+  short_description: "Build source-backed review-ready artifacts"
+  default_prompt: "Use $build-review-artifacts to turn this plan, report, or evidence into a polished shareable artifact for review."
+policy:
+  allow_implicit_invocation: true
