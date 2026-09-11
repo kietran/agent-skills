@@ -34,6 +34,31 @@ class BecaLogtimeTests(unittest.TestCase):
         self.assertEqual(beca_logtime.html_description("Fix API"), "<p>Fix API</p>")
         self.assertEqual(beca_logtime.html_description("<p>Fix API</p>"), "<p>Fix API</p>")
 
+    def test_structured_description_uses_current_form_sections_and_escapes_text(self) -> None:
+        value = beca_logtime.structured_description(
+            "Fix API <done>", "Passed", "None", "Deploy & monitor"
+        )
+        self.assertIn("<em>Đã thực hiện</em>: Fix API &lt;done&gt;", value)
+        self.assertIn("<em>Kết quả</em>: Passed", value)
+        self.assertIn("<em>Vướng mắc</em>: None", value)
+        self.assertIn("<em>Bước tiếp theo</em>: Deploy &amp; monitor", value)
+
+    def test_validate_hours_matches_backend_integer_range(self) -> None:
+        self.assertEqual(beca_logtime.validate_hours("1"), "1")
+        self.assertEqual(beca_logtime.validate_hours("16"), "16")
+        for invalid in ("0", "0.5", "17", "nope"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(beca_logtime.BecaError):
+                    beca_logtime.validate_hours(invalid)
+
+    def test_response_data_accepts_extended_envelope_but_not_task_data_field(self) -> None:
+        self.assertEqual(
+            beca_logtime.response_data({"data": [1], "status": 200, "traceId": "abc", "newMeta": True}),
+            [1],
+        )
+        task = {"data": None, "status": "1330833", "title": "Task"}
+        self.assertIs(beca_logtime.response_data(task), task)
+
     def test_normalize_user_id(self) -> None:
         self.assertEqual(beca_logtime.normalize_user_id("P:10000"), "P:10000")
         self.assertEqual(beca_logtime.normalize_user_id("10000"), "P:10000")
@@ -64,6 +89,60 @@ class BecaLogtimeTests(unittest.TestCase):
         )
         self.assertEqual([task["title"] for task in tasks], ["Parent", "Child"])
         self.assertEqual(tasks[1]["parentTitle"], "Parent")
+
+    def test_list_comments_filters_since_date_and_non_mine_tasks(self) -> None:
+        class CommentClient:
+            def get_json(self, path, params=None):
+                if path == "/api/Default/Work_GetWorkInProcess":
+                    return [
+                        {
+                            "userWorkflowId": "100",
+                            "title": "Mine",
+                            "isMyWork": True,
+                        },
+                        {
+                            "userWorkflowId": "200",
+                            "title": "Not mine",
+                            "isMyWork": False,
+                        },
+                    ]
+                if path == "/api/Default/Work_GetComment":
+                    self.assert_work_id = (params or {}).get("workId")
+                    return [
+                        {
+                            "id": 2,
+                            "workId": "100",
+                            "workName": "Mine",
+                            "fullName": "BA User",
+                            "note": "<p>Logic mới</p>",
+                            "lastModified": "2026-07-16T08:00:00",
+                        },
+                        {
+                            "id": 1,
+                            "workId": "100",
+                            "note": "Comment cũ",
+                            "lastModified": "2026-07-14T08:00:00",
+                        },
+                    ]
+                raise AssertionError(path)
+
+        client = CommentClient()
+        rows = beca_logtime.list_comments(
+            client,
+            Namespace(since="2026-07-15", work_id=None, type="Xử lý", rows=200),
+        )
+        self.assertEqual(client.assert_work_id, "100")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["commentId"], 2)
+        self.assertEqual(rows[0]["comment"], "Logic mới")
+
+    def test_list_comments_parser_defaults_to_assigned_tasks(self) -> None:
+        args = beca_logtime.build_parser().parse_args(
+            ["list-comments", "--since", "2026-07-15"]
+        )
+        self.assertIsNone(args.work_id)
+        self.assertEqual(args.rows, 200)
+        self.assertIs(args.func, beca_logtime.command_list_comments)
 
     def test_object_to_fields_uses_none_for_empty_values(self) -> None:
         self.assertEqual(
@@ -109,6 +188,22 @@ class BecaLogtimeTests(unittest.TestCase):
         self.assertEqual(client.captured["headers"]["X-XSRF-TOKEN"], "token-123")
         self.assertEqual(client.captured["headers"]["Origin"], beca_logtime.WORK_ORIGIN)
 
+    def test_cross_host_redirect_strips_explicit_cookie_header(self) -> None:
+        request = beca_logtime.Request(
+            "https://work.becawork.vn/api/test",
+            headers={"Cookie": "sid=secret"},
+        )
+        redirected = beca_logtime.SameOriginRedirectHandler().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://sso.becawork.vn/Account/Login",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Cookie"))
+
     def test_prepare_blocks_negative_over_logtime_before_duplicate_check(self) -> None:
         client = FakeClient(over="-8", logs=[{"Ngay": "2026-07-01 00:00:00"}])
         with self.assertRaisesRegex(beca_logtime.BecaError, "Over-logtime"):
@@ -119,6 +214,11 @@ class BecaLogtimeTests(unittest.TestCase):
         client = FakeClient(over=0, logs=[{"id": 7, "Ngay": "2026-07-01 00:00:00"}])
         with self.assertRaisesRegex(beca_logtime.BecaError, "existing logtime"):
             beca_logtime.prepare_logtime(client, make_args())
+
+    def test_prepare_rejects_action_not_in_live_form(self) -> None:
+        client = FakeClient(over=0, logs=[])
+        with self.assertRaisesRegex(beca_logtime.BecaError, "Allowed values"):
+            beca_logtime.prepare_logtime(client, make_args(action="Unknown"))
 
     def test_submit_validates_before_save(self) -> None:
         client = FakeClient(over=0, logs=[])
@@ -164,7 +264,8 @@ class BecaLogtimeTests(unittest.TestCase):
         self.assertEqual(values["Email"], "user@example.com")
         self.assertEqual(values["UserId"], "P:10000")
         self.assertEqual(values["SoGio"], "6")
-        self.assertEqual(values["Mota"], "<p>Updated work</p>")
+        self.assertIn("<em>Đã thực hiện</em>: Updated work", values["Mota"])
+        self.assertIn("<em>Kết quả</em>:", values["Mota"])
 
     def test_update_uses_log_user_workflow_id_in_endpoint(self) -> None:
         client = FakeClient(over=2, logs=[])
@@ -202,7 +303,8 @@ class BecaLogtimeTests(unittest.TestCase):
         text = output.getvalue()
         self.assertIn("Preview logtime mới", text)
         self.assertIn("- Work ID: 1415256", text)
-        self.assertIn("- Mô tả: Worked on Public Wifi backend", text)
+        self.assertIn("- Mô tả: Đã thực hiện: Worked on Public Wifi backend", text)
+        self.assertIn("Kết quả:", text)
         self.assertFalse(text.lstrip().startswith("{"))
 
     def test_submit_defaults_to_human_readable_text_after_save(self) -> None:
@@ -286,6 +388,11 @@ class BecaLogtimeTests(unittest.TestCase):
         )
         self.assertEqual(prepared.target["userWorkflowId"], "1330833")
 
+    def test_status_id_rejects_internal_id(self) -> None:
+        client = FakeClient(over=0, logs=[])
+        with self.assertRaisesRegex(beca_logtime.BecaError, "userWorkflowId"):
+            beca_logtime.prepare_status_update(client, make_status_args(status_id="9213"))
+
     def test_update_status_uses_status_user_workflow_id(self) -> None:
         client = FakeClient(over=0, logs=[])
         with redirect_stdout(io.StringIO()):
@@ -364,14 +471,46 @@ class BecaLogtimeTests(unittest.TestCase):
         self.assertEqual(entry.description, "Design lại phần điều khiển trên FE")
         self.assertEqual(entry.progress, "28.5%")
 
+    def test_daily_parse_entry_with_structured_description(self) -> None:
+        entry = beca_logtime.parse_daily_entry(
+            "Energy | 8 | Xây API | result=Đã chạy | blockers=Không | next=Deploy"
+        )
+        self.assertEqual(entry.result, "Đã chạy")
+        self.assertEqual(entry.blockers, "Không")
+        self.assertEqual(entry.next_step, "Deploy")
+
     def test_daily_total_hours_must_be_exactly_eight(self) -> None:
         client = FakeClient(over=0, logs=[])
         with self.assertRaisesRegex(beca_logtime.BecaError, "exactly 8"):
-            beca_logtime.prepare_daily(
-                client,
-                make_daily_args(entry=["Multimedia | 6 | Work", "diagram | 1.5 | Work"]),
-            )
+            beca_logtime.prepare_daily(client, make_daily_args(entry=["Multimedia | 6 | Work", "diagram | 1 | Work"]))
         self.assertEqual(client.calls, [])
+
+    def test_list_logtimes_filters_period_response_to_requested_day(self) -> None:
+        client = FakeClient(
+            over=0,
+            logs=[],
+            timesheet_rows=[
+                log_row_from_values({"Ngay": "2026-07-01", "SoGio": 8, "Congviec": "1", "Duan": "p"}, 1, 11),
+                log_row_from_values({"Ngay": "2026-07-02", "SoGio": 8, "Congviec": "2", "Duan": "p"}, 2, 12),
+            ],
+        )
+        rows = beca_logtime.list_logtimes(
+            client,
+            Namespace(date="2026-07-01", department=None, project_id="-1"),
+        )
+        self.assertEqual([row["logId"] for row in rows], ["1"])
+
+    def test_comment_redaction_is_default_and_can_be_disabled(self) -> None:
+        secret = "tài khoản test: demo / Secret123 password: Hidden456"
+        redacted = beca_logtime.redact_sensitive_text(secret)
+        self.assertNotIn("Secret123", redacted)
+        self.assertNotIn("Hidden456", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_api_setting_missing_ids_fails_closed(self) -> None:
+        client = FakeClient(over=0, logs=[], api_setting={})
+        with self.assertRaisesRegex(beca_logtime.BecaError, "hard-coded"):
+            beca_logtime.get_api_setting(client)
 
     def test_daily_resolves_work_id_exact_substring_and_accent_insensitive(self) -> None:
         client = FakeClient(over=0, logs=[])
@@ -630,6 +769,8 @@ class FakeClient:
         form_guard="",
         status_guard="",
         progress_update_visible=True,
+        timesheet_rows=None,
+        api_setting=None,
     ) -> None:
         self.over = over
         self.logs = logs
@@ -732,6 +873,11 @@ class FakeClient:
         self.form_guard = form_guard
         self.status_guard = status_guard
         self.progress_update_visible = progress_update_visible
+        self.timesheet_rows = list(timesheet_rows or [])
+        self.api_setting = api_setting if api_setting is not None else {
+            "id_getWorkFormLogTime": {"id": 101},
+            "id_getWorkFormLogTimeStep": {"id": 415},
+        }
         self.calls = []
         self.requests = []
 
@@ -739,10 +885,7 @@ class FakeClient:
         self.calls.append(f"GET:{path}")
         self.requests.append({"method": "GET", "path": path, "params": params or {}})
         if path == "/api/Default/Work_GetApiSetting":
-            return {
-                "id_getWorkFormLogTime": {"id": 101},
-                "id_getWorkFormLogTimeStep": {"id": 415},
-            }
+            return self.api_setting
         if path == "/api/Default/Work_GetInfLogin":
             return self.user
         if path == "/api/Default/Work_CheckOverInLogtime":
@@ -754,7 +897,7 @@ class FakeClient:
         if path == "/api/Default/Work_GetWorkInProcess":
             return self.tasks
         if path == "/api/Default/Work_TimeSheetPersonalLayoutList":
-            return []
+            return self.timesheet_rows
         if path == "/api/Default/Work_DetailInfo":
             return self.task_detail
         if path == "/api/Default/Work_GetNextStatus":
@@ -790,6 +933,33 @@ class FakeClient:
                     "row": [
                         {"name": "Nguoilap", "defaultValue": "Demo User"},
                         {"name": "Email", "defaultValue": "user@example.com"},
+                        {
+                            "name": "SoGio",
+                            "type": "number",
+                            "minimum": 1.0,
+                            "maximum": 16.0,
+                            "numberOfDecimalPlaces": 0,
+                        },
+                        {
+                            "name": "Hanhdong",
+                            "type": "select",
+                            "selectItems": [
+                                {"label": "Thực hiện", "value": "Thực hiện"},
+                                {"label": "Xem xét", "value": "Xem xét"},
+                                {"label": "Kiểm thử", "value": "Kiểm thử"},
+                                {"label": "Theo dõi", "value": "Theo dõi"},
+                            ],
+                        },
+                        {
+                            "name": "Mota",
+                            "type": "editor",
+                            "defaultValue": (
+                                "<ul><li><p><em>Đã thực hiện</em>: </p></li>"
+                                "<li><p><em>Kết quả</em>:</p></li>"
+                                "<li><p><em>Vướng mắc</em>:</p></li>"
+                                "<li><p><em>Bước tiếp theo</em>:</p></li></ul>"
+                            ),
+                        },
                     ]
                 }
             ]

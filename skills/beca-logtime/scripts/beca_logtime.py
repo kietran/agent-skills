@@ -8,6 +8,7 @@ import html.parser
 import json
 import os
 import re
+import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from http.cookiejar import CookieJar
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urljoin, urlparse
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener
 from zoneinfo import ZoneInfo
 
 
@@ -38,6 +39,16 @@ class BecaError(RuntimeError):
     pass
 
 
+class SameOriginRedirectHandler(HTTPRedirectHandler):
+    """Do not forward an explicitly supplied Cookie header to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected and urlparse(req.full_url).netloc != urlparse(newurl).netloc:
+            redirected.remove_header("Cookie")
+        return redirected
+
+
 class FormParser(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -53,6 +64,49 @@ class FormParser(html.parser.HTMLParser):
             name = values.get("name")
             if name:
                 self.inputs[name] = values.get("value") or ""
+
+
+def kwallet_lookup(entry: str) -> str | None:
+    wallet = os.getenv("BECA_KWALLET", "kdewallet")
+    folder = os.getenv("BECA_KWALLET_FOLDER")
+    command = ["kwallet-query"]
+    if folder:
+        command.extend(["-f", folder])
+    command.extend(["-r", f"beca-logtime:{entry}", wallet])
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.rstrip("\n")
+    return value or None
+
+
+def secret_tool_lookup(attributes: dict[str, str]) -> str | None:
+    command = ["secret-tool", "lookup"]
+    for key, value in attributes.items():
+        command.extend([key, value])
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.rstrip("\n")
+    return value or None
 
 
 @dataclass
@@ -101,6 +155,9 @@ class DailyEntry:
     task_query: str
     hours: str
     description: str
+    result: str | None = None
+    blockers: str | None = None
+    next_step: str | None = None
     progress: str | None = None
 
 
@@ -123,14 +180,28 @@ class PreparedDaily:
 class BecaClient:
     def __init__(self, cookie: str | None = None) -> None:
         self.cookie = cookie
-        self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        self.opener = build_opener(
+            SameOriginRedirectHandler(),
+            HTTPCookieProcessor(CookieJar()),
+        )
         self._xsrf_token: str | None = None
 
     def ensure_auth(self) -> None:
         if self.cookie:
             return
-        username = os.getenv("BECA_USERNAME") or input("BecaWork username: ")
-        password = os.getenv("BECA_PASSWORD") or getpass.getpass("BecaWork password: ")
+        username = (
+            os.getenv("BECA_USERNAME")
+            or secret_tool_lookup({"service": "becawork", "kind": "username"})
+            or kwallet_lookup("username")
+        )
+        if not username:
+            username = input("BecaWork username: ")
+
+        password = os.getenv("BECA_PASSWORD") or secret_tool_lookup(
+            {"service": "becawork", "kind": "password", "username": username}
+        ) or kwallet_lookup("password")
+        if not password:
+            password = getpass.getpass("BecaWork password: ")
         self.login(username, password)
 
     def login(self, username: str, password: str) -> None:
@@ -321,6 +392,32 @@ def html_description(description: str) -> str:
     return f"<p>{description}</p>"
 
 
+def structured_description(
+    done: str,
+    result: str | None = None,
+    blockers: str | None = None,
+    next_step: str | None = None,
+) -> str:
+    """Build the four-section HTML currently supplied by the BecaWork form."""
+    stripped = str(done or "").strip()
+    extra_values = (result, blockers, next_step)
+    if stripped.startswith("<") and not any(value is not None for value in extra_values):
+        return done
+    if not stripped:
+        raise BecaError("Description/Đã thực hiện is required.")
+    sections = (
+        ("Đã thực hiện", stripped),
+        ("Kết quả", str(result or "").strip()),
+        ("Vướng mắc", str(blockers or "").strip()),
+        ("Bước tiếp theo", str(next_step or "").strip()),
+    )
+    items = "".join(
+        f"<li><p><em>{html.escape(label)}</em>: {html.escape(value)}</p></li>"
+        for label, value in sections
+    )
+    return f"<ul>{items}</ul>"
+
+
 def normalize_user_id(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
@@ -384,6 +481,51 @@ def default_field_value(form_format: list[dict[str, Any]], name: str) -> str | N
     return str(value) if value is not None else None
 
 
+def validate_hours(value: Any, form_format: list[dict[str, Any]] | None = None) -> str:
+    number = number_or_none(value)
+    if number is None or not number.is_integer():
+        raise BecaError("Logtime hours must be a whole number.")
+
+    minimum = 1.0
+    maximum = 16.0
+    if form_format is not None:
+        field = find_field(form_format, "SoGio")
+        if not field:
+            raise BecaError("BecaWork logtime form no longer contains the SoGio field.")
+        if field.get("type") != "number":
+            raise BecaError(f"BecaWork SoGio contract changed: expected type=number, got {field.get('type')!r}.")
+        decimal_places = number_or_none(field.get("numberOfDecimalPlaces"))
+        if decimal_places != 0:
+            raise BecaError(
+                "BecaWork SoGio contract changed: expected numberOfDecimalPlaces=0. Run a contract audit before submitting."
+            )
+        field_minimum = number_or_none(field.get("minimum"))
+        field_maximum = number_or_none(field.get("maximum"))
+        if field_minimum is not None:
+            minimum = field_minimum
+        if field_maximum is not None:
+            maximum = field_maximum
+
+    if number < minimum or number > maximum:
+        raise BecaError(f"Logtime hours must be between {api_number_text(minimum)} and {api_number_text(maximum)}.")
+    return api_number_text(number)
+
+
+def validate_action(value: Any, form_format: list[dict[str, Any]]) -> str:
+    action = str(value or "").strip()
+    field = find_field(form_format, "Hanhdong")
+    if not field:
+        raise BecaError("BecaWork logtime form no longer contains the Hanhdong field.")
+    select_items = field.get("selectItems")
+    if not isinstance(select_items, list) or not select_items:
+        raise BecaError("BecaWork Hanhdong contract changed: selectItems is missing or empty.")
+    allowed = [str(item.get("value") or "").strip() for item in select_items if isinstance(item, dict)]
+    allowed = [item for item in allowed if item]
+    if action not in allowed:
+        raise BecaError(f"Unsupported logtime action {action!r}. Allowed values: {', '.join(allowed)}.")
+    return action
+
+
 def object_to_fields(values: dict[str, Any]) -> list[dict[str, Any]]:
     fields: list[dict[str, Any]] = []
     for name, value in values.items():
@@ -402,9 +544,22 @@ def build_form_payload(values: dict[str, Any]) -> dict[str, Any]:
 
 
 def response_data(value: Any) -> Any:
-    if isinstance(value, dict) and set(value.keys()) <= {"data", "status", "message", "hasErrors"}:
-        return value.get("data")
+    if isinstance(value, dict) and "data" in value:
+        keys = set(value)
+        envelope_keys = {
+            "data", "status", "message", "hasErrors", "success", "isSuccess",
+            "errors", "traceId", "timestamp", "requestId",
+        }
+        strong_markers = {"message", "hasErrors", "success", "isSuccess", "errors", "traceId"}
+        if keys <= envelope_keys or keys & strong_markers:
+            return value.get("data")
     return value
+
+
+def api_truthy(value: Any) -> bool:
+    if value is True or value == 1:
+        return True
+    return str(value or "").strip().casefold() in {"true", "1", "yes"}
 
 
 def log_row_id(row: dict[str, Any]) -> str:
@@ -469,38 +624,112 @@ def list_tasks(client: BecaClient, args: argparse.Namespace) -> list[dict[str, A
         "typeSort": 0,
         "overDue": -1,
     }
-    data = client.get_json("/api/Default/Work_GetWorkInProcess", params)
+    data = response_data(client.get_json("/api/Default/Work_GetWorkInProcess", params))
     if not isinstance(data, list):
         raise BecaError("Unexpected Work_GetWorkInProcess response.")
     tasks = flatten_tasks(data)
     if args.mine_only:
-        tasks = [task for task in tasks if task.get("isMyWork") is True]
+        tasks = [task for task in tasks if api_truthy(task.get("isMyWork"))]
     return tasks
+
+
+def comment_date(comment: dict[str, Any]) -> str | None:
+    return normalize_date_value(comment.get("lastModified") or comment.get("LastModified"))
+
+
+def list_comments(client: BecaClient, args: argparse.Namespace) -> list[dict[str, Any]]:
+    since_date = parse_log_date(args.since)
+    if args.work_id:
+        detail = get_task_detail(client, str(args.work_id))
+        tasks = [detail]
+    else:
+        task_args = argparse.Namespace(
+            title="",
+            project_name="",
+            type=args.type,
+            page=1,
+            rows=args.rows,
+            mine_only=True,
+        )
+        tasks = list_tasks(client, task_args)
+
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        work_id = task_work_id(task)
+        if not work_id:
+            continue
+        data = response_data(
+            client.get_json("/api/Default/Work_GetComment", {"workId": work_id})
+        )
+        if data is None:
+            data = []
+        if not isinstance(data, list):
+            raise BecaError(f"Unexpected Work_GetComment response for work {work_id}.")
+        for comment in data:
+            if not isinstance(comment, dict):
+                continue
+            modified_date = comment_date(comment)
+            if not modified_date or modified_date < since_date.isoformat():
+                continue
+            comment_text = plain_text_description(comment.get("note") or comment.get("Note"))
+            if not getattr(args, "show_sensitive", False):
+                comment_text = redact_sensitive_text(comment_text)
+            rows.append(
+                {
+                    "commentId": first_value(comment.get("id"), comment.get("Id")),
+                    "workId": first_text(comment.get("workId"), comment.get("WorkId"), work_id),
+                    "task": first_text(
+                        comment.get("workName"),
+                        comment.get("WorkName"),
+                        task_title(task),
+                    ),
+                    "author": first_text(comment.get("fullName"), comment.get("FullName")),
+                    "comment": comment_text,
+                    "lastModified": first_text(
+                        comment.get("lastModified"), comment.get("LastModified")
+                    ),
+                }
+            )
+    return sorted(
+        rows,
+        key=lambda row: (normalize_date_value(row.get("lastModified")) or "", str(row.get("commentId") or "")),
+        reverse=True,
+    )
 
 
 def parse_daily_entry(raw: str) -> DailyEntry:
     parts = [part.strip() for part in str(raw or "").split("|")]
-    if len(parts) not in {3, 4}:
-        raise BecaError('Daily entry must use: "task | hours | description [| progress=28]".')
+    if len(parts) < 3:
+        raise BecaError(
+            'Daily entry must use: "task | hours | description [| result=... | blockers=... | next=... | progress=28]".'
+        )
     task_query, hours_raw, description = parts[:3]
     if not task_query:
         raise BecaError("Daily entry task query is required.")
-    hours_number = number_or_none(hours_raw)
-    if hours_number is None or hours_number <= 0:
-        raise BecaError("Daily entry hours must be a positive number.")
+    hours = validate_hours(hours_raw)
     if not description:
         raise BecaError("Daily entry description is required.")
-    progress = None
-    if len(parts) == 4:
-        option = parts[3]
-        if not option.lower().startswith("progress="):
-            raise BecaError("Daily entry fourth field must be progress=VALUE.")
-        progress = normalize_progress_percent(option.split("=", 1)[1])
+    options: dict[str, str] = {}
+    aliases = {"next-step": "next", "next_step": "next", "blocker": "blockers"}
+    for option in parts[3:]:
+        if "=" not in option:
+            raise BecaError(f"Daily entry option must use key=value: {option!r}.")
+        key, value = option.split("=", 1)
+        key = aliases.get(key.strip().lower(), key.strip().lower())
+        if key not in {"result", "blockers", "next", "progress"}:
+            raise BecaError(f"Unsupported daily entry option: {key}.")
+        if key in options:
+            raise BecaError(f"Duplicate daily entry option: {key}.")
+        options[key] = value.strip()
+    progress = normalize_progress_percent(options["progress"]) if "progress" in options else None
     return DailyEntry(
         raw=raw,
         task_query=task_query,
-        hours=api_number_text(hours_number),
+        hours=hours,
         description=description,
+        result=options.get("result"),
+        blockers=options.get("blockers"),
+        next_step=options.get("next"),
         progress=progress,
     )
 
@@ -597,6 +826,9 @@ def daily_logtime_args(args: argparse.Namespace, entry: DailyEntry, task: dict[s
         hours=entry.hours,
         action="Thực hiện",
         description=entry.description,
+        result=entry.result,
+        blockers=entry.blockers,
+        next_step=entry.next_step,
         allow_duplicate=args.allow_duplicate,
     )
 
@@ -707,13 +939,12 @@ def resolve_status_target(
     if status_id:
         target_id = str(status_id).strip()
         for item in statuses:
-            if target_id in {
-                status_workflow_id(item),
-                first_text(item.get("id"), item.get("Id")),
-                first_text(item.get("theSameId")),
-            }:
+            if target_id == status_workflow_id(item):
                 return item
-        raise BecaError(f"Status id {target_id} is not available for this work.")
+        raise BecaError(
+            f"Status userWorkflowId {target_id} is not available for this work. "
+            "Do not pass the internal id or theSameId."
+        )
 
     target_name = normalized_lookup_text(status)
     matches = [item for item in statuses if normalized_lookup_text(status_name(item)) == target_name]
@@ -837,16 +1068,22 @@ def prepare_progress_update(client: BecaClient, args: argparse.Namespace) -> Pre
 
 
 def get_api_setting(client: BecaClient) -> tuple[str, str]:
-    data = client.get_json("/api/Default/Work_GetApiSetting")
+    data = response_data(client.get_json("/api/Default/Work_GetApiSetting"))
     if not isinstance(data, dict):
         raise BecaError("Unexpected Work_GetApiSetting response.")
-    form_id = data.get("id_getWorkFormLogTime", {}).get("id") or 101
-    step_id = data.get("id_getWorkFormLogTimeStep", {}).get("id") or 415
+    form_setting = data.get("id_getWorkFormLogTime")
+    step_setting = data.get("id_getWorkFormLogTimeStep")
+    form_id = form_setting.get("id") if isinstance(form_setting, dict) else None
+    step_id = step_setting.get("id") if isinstance(step_setting, dict) else None
+    if form_id in (None, "") or step_id in (None, ""):
+        raise BecaError(
+            "BecaWork did not return logtime formId/stepId. Refusing to use stale hard-coded workflow ids."
+        )
     return str(form_id), str(step_id)
 
 
 def get_form_format(client: BecaClient, form_id: str) -> list[dict[str, Any]]:
-    data = client.post_json(
+    data = response_data(client.post_json(
         "/api/ApiEoffice/Eoffice_GetData",
         [
             {"Name": "id", "Value": int(form_id) if str(form_id).isdigit() else form_id},
@@ -858,10 +1095,62 @@ def get_form_format(client: BecaClient, form_id: str) -> list[dict[str, Any]]:
             "projectId": "undefined",
             "workId": "undefined",
         },
-    )
+    ))
     if not isinstance(data, list):
         raise BecaError("Unexpected getFormatWorkflow response.")
     return data
+
+
+def inspect_logtime_contract(client: BecaClient) -> dict[str, Any]:
+    form_id, step_id = get_api_setting(client)
+    form_format = get_form_format(client, form_id)
+    required_fields = (
+        "Nguoilap", "Ngaylap", "Email", "Duan", "Congviec",
+        "Ngay", "SoGio", "Hanhdong", "Mota", "UserId",
+    )
+    missing = [name for name in required_fields if not find_field(form_format, name)]
+    issues = [f"Missing form field: {name}" for name in missing]
+
+    hours_field = find_field(form_format, "SoGio") or {}
+    hours_contract = {
+        "type": hours_field.get("type"),
+        "minimum": hours_field.get("minimum"),
+        "maximum": hours_field.get("maximum"),
+        "numberOfDecimalPlaces": hours_field.get("numberOfDecimalPlaces"),
+    }
+    if hours_field:
+        try:
+            validate_hours("1", form_format)
+            validate_hours("16", form_format)
+        except BecaError as exc:
+            issues.append(str(exc))
+
+    action_field = find_field(form_format, "Hanhdong") or {}
+    action_values = [
+        str(item.get("value") or "").strip()
+        for item in (action_field.get("selectItems") or [])
+        if isinstance(item, dict) and str(item.get("value") or "").strip()
+    ]
+    if not action_values:
+        issues.append("Hanhdong.selectItems is missing or empty.")
+
+    description_template = default_field_value(form_format, "Mota") or ""
+    template_text = plain_text_description(description_template)
+    expected_sections = ("Đã thực hiện", "Kết quả", "Vướng mắc", "Bước tiếp theo")
+    missing_sections = [label for label in expected_sections if label not in template_text]
+    if missing_sections:
+        issues.append(f"Mota.defaultValue is missing sections: {', '.join(missing_sections)}")
+
+    return {
+        "compatible": not issues,
+        "formId": form_id,
+        "stepId": step_id,
+        "missingFields": missing,
+        "hours": hours_contract,
+        "actions": action_values,
+        "descriptionTemplate": description_template,
+        "issues": issues,
+    }
 
 
 def duplicate_logs(
@@ -871,7 +1160,7 @@ def duplicate_logs(
     exclude_log_id: str | None = None,
     exclude_user_workflow_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    data = client.get_json("/api/Default/Work_GetLogtimeByWorkId", {"WorkFlowId": work_id})
+    data = response_data(client.get_json("/api/Default/Work_GetLogtimeByWorkId", {"WorkFlowId": work_id}))
     if not isinstance(data, list):
         raise BecaError("Unexpected Work_GetLogtimeByWorkId response.")
     target = log_date.isoformat()
@@ -907,12 +1196,13 @@ def check_over_logtime(
 
 def prepare_logtime(client: BecaClient, args: argparse.Namespace) -> PreparedLogtime:
     log_date = parse_log_date(args.date)
-    hours = api_number_text(args.hours)
     if not args.description or not args.description.strip():
         raise BecaError("--description is required.")
 
     form_id, step_id = get_api_setting(client)
     form_format = get_form_format(client, form_id)
+    hours = validate_hours(args.hours, form_format)
+    action = validate_action(args.action, form_format)
     user = client.get_json("/api/Default/Work_GetInfLogin", {"IsMobile": "false"})
     if not isinstance(user, dict):
         raise BecaError("Unexpected Work_GetInfLogin response.")
@@ -938,8 +1228,13 @@ def prepare_logtime(client: BecaClient, args: argparse.Namespace) -> PreparedLog
         "Congviec": str(args.work_id).strip(),
         "Ngay": f"{log_date.isoformat()} 00:00:00",
         "SoGio": hours,
-        "Hanhdong": args.action,
-        "Mota": html_description(args.description),
+        "Hanhdong": action,
+        "Mota": structured_description(
+            args.description,
+            getattr(args, "result", None),
+            getattr(args, "blockers", None),
+            getattr(args, "next_step", None),
+        ),
         "UserId": normalize_user_id(user.get("id")),
     }
     payload = build_form_payload(values)
@@ -994,6 +1289,7 @@ def prepare_update_logtime(client: BecaClient, args: argparse.Namespace) -> Prep
         raise BecaError("This logtime row is linked to check-in; edit is not supported in v1.")
 
     form_id, _step_id = get_api_setting(client)
+    form_format = get_form_format(client, form_id)
     user = get_current_user(client)
     current_email = first_text(user.get("email")).lower()
     existing_email = first_text(existing.get("Email"), existing.get("email")).lower()
@@ -1013,17 +1309,28 @@ def prepare_update_logtime(client: BecaClient, args: argparse.Namespace) -> Prep
 
     old_date = existing_log_date(existing)
     log_date = parse_log_date(args.date) if args.date else old_date
-    hours = api_number_text(args.hours if args.hours is not None else existing.get("SoGio"))
-    if not hours or hours == "None":
+    raw_hours = args.hours if args.hours is not None else existing.get("SoGio")
+    if raw_hours in (None, ""):
         raise BecaError("Existing logtime response did not include hours; pass --hours.")
+    hours = validate_hours(raw_hours, form_format)
     old_hours = api_number_text(existing.get("SoGio") or "0") if log_date == old_date else "0"
-    action = args.action if args.action is not None else first_text(existing.get("Hanhdong"), "Thực hiện")
+    action = validate_action(
+        args.action if args.action is not None else first_text(existing.get("Hanhdong"), "Thực hiện"),
+        form_format,
+    )
     if args.description is None:
+        if any(getattr(args, name, None) is not None for name in ("result", "blockers", "next_step")):
+            raise BecaError("Pass --description together with --result/--blockers/--next-step.")
         description = first_text(existing.get("Mota"), existing.get("description"))
     elif not args.description.strip():
         raise BecaError("--description cannot be blank when updating description.")
     else:
-        description = html_description(args.description)
+        description = structured_description(
+            args.description,
+            getattr(args, "result", None),
+            getattr(args, "blockers", None),
+            getattr(args, "next_step", None),
+        )
 
     over_logtime = response_data(check_over_logtime(client, log_date, hours, old_hours))
     over_logtime_number = number_or_none(over_logtime)
@@ -1118,7 +1425,7 @@ def list_logtimes(client: BecaClient, args: argparse.Namespace) -> list[dict[str
     log_date = parse_log_date(args.date)
     user = get_current_user(client)
     department = first_text(args.department, user.get("departmentId"), user.get("department"))
-    data = client.get_json(
+    data = response_data(client.get_json(
         "/api/Default/Work_TimeSheetPersonalLayoutList",
         {
             "date": log_date.isoformat(),
@@ -1126,11 +1433,17 @@ def list_logtimes(client: BecaClient, args: argparse.Namespace) -> list[dict[str
             "email": normalize_user_id(user.get("id")),
             "department": department,
         },
-    )
+    ))
     if not isinstance(data, list):
         raise BecaError("Unexpected Work_TimeSheetPersonalLayoutList response.")
     rows = [summarize_logtime_row(row) for row in flatten_logtime_items(data)]
-    return [row for row in rows if row["logId"] or row["logUserWorkflowId"] or row["workId"]]
+    target_date = log_date.isoformat()
+    return [
+        row
+        for row in rows
+        if row.get("date") == target_date
+        and (row["logId"] or row["logUserWorkflowId"] or row["workId"])
+    ]
 
 
 def values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1265,7 +1578,7 @@ def verify_saved_logtime(
     work_id = first_text(expected.get("Congviec"), expected.get("workId"))
     if not work_id:
         raise BecaError("Cannot verify logtime without work id.")
-    data = client.get_json("/api/Default/Work_GetLogtimeByWorkId", {"WorkFlowId": work_id})
+    data = response_data(client.get_json("/api/Default/Work_GetLogtimeByWorkId", {"WorkFlowId": work_id}))
     if not isinstance(data, list):
         raise BecaError("Unexpected Work_GetLogtimeByWorkId response during verification.")
 
@@ -1372,6 +1685,21 @@ def plain_text_description(value: Any) -> str:
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text)
     return " ".join(text.split())
+
+
+def redact_sensitive_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)\b(password|mật\s*khẩu|passwd|pwd|api[ _-]?key|token|secret)\b(\s*[:=]\s*)([^\s,;]+)",
+        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(tài\s*khoản(?:\s+test)?\s*:\s*)([^/\s]+)(\s*/\s*)([^\s,;]+)",
+        lambda match: f"{match.group(1)}[REDACTED]{match.group(3)}[REDACTED]",
+        text,
+    )
+    return text
 
 
 def display_value(value: Any, fallback: str = "-") -> str:
@@ -1612,6 +1940,19 @@ def render_daily_result_text(result: dict[str, Any]) -> str:
 
 
 def task_summary(detail: dict[str, Any]) -> dict[str, Any]:
+    executors = detail.get("userExecStatus", detail.get("UserExecStatus"))
+    if isinstance(executors, list):
+        executor_summary = [
+            {
+                "id": first_text(item.get("id"), item.get("userId")) or None,
+                "fullName": first_text(item.get("fullName"), item.get("name")) or None,
+                "email": first_text(item.get("email")) or None,
+            }
+            for item in executors
+            if isinstance(item, dict)
+        ]
+    else:
+        executor_summary = executors
     return {
         "workId": first_text(detail.get("userWorkflowId"), detail.get("UserWorkflowId")) or None,
         "title": first_text(detail.get("title"), detail.get("Title")) or None,
@@ -1622,7 +1963,7 @@ def task_summary(detail: dict[str, Any]) -> dict[str, Any]:
         "statusType": first_text(detail.get("statusType"), detail.get("StatusType")) or None,
         "progress": first_text(detail.get("progress"), detail.get("Progress")) or None,
         "createdBy": first_text(detail.get("createdBy"), detail.get("CreatedBy")) or None,
-        "userExecStatus": first_text(detail.get("userExecStatus"), detail.get("UserExecStatus")) or None,
+        "userExecStatus": executor_summary or None,
         "dateExec": first_text(detail.get("dateExec"), detail.get("DateExec")) or None,
     }
 
@@ -1818,6 +2159,18 @@ def print_logtimes(rows: list[dict[str, Any]], as_json: bool) -> None:
         )
 
 
+def print_comments(rows: list[dict[str, Any]], as_json: bool) -> None:
+    if as_json:
+        print_json(rows)
+        return
+    print(f"{'WORK':<12} {'LAST MODIFIED':<20} {'BY':<24} COMMENT")
+    for row in rows:
+        print(
+            f"{str(row['workId'] or ''):<12} {str(row['lastModified'] or ''):<20} "
+            f"{str(row['author'] or ''):<24} {row['comment'] or ''}"
+        )
+
+
 def command_list_tasks(client: BecaClient, args: argparse.Namespace) -> int:
     tasks = list_tasks(client, args)
     print_tasks(tasks, args.json)
@@ -1828,6 +2181,31 @@ def command_list_logtimes(client: BecaClient, args: argparse.Namespace) -> int:
     rows = list_logtimes(client, args)
     print_logtimes(rows, args.json)
     return 0
+
+
+def command_list_comments(client: BecaClient, args: argparse.Namespace) -> int:
+    rows = list_comments(client, args)
+    print_comments(rows, args.json)
+    return 0
+
+
+def command_check_contracts(client: BecaClient, args: argparse.Namespace) -> int:
+    result = inspect_logtime_contract(client)
+    if args.json:
+        print_json(result)
+    else:
+        print("BecaWork logtime contract")
+        print(f"- Compatible: {'Yes' if result['compatible'] else 'No'}")
+        print(f"- Form ID: {result['formId']} | Step ID: {result['stepId']}")
+        hours = result["hours"]
+        print(
+            f"- Hours: {hours.get('type')}, min={hours.get('minimum')}, "
+            f"max={hours.get('maximum')}, decimals={hours.get('numberOfDecimalPlaces')}"
+        )
+        print(f"- Actions: {', '.join(result['actions']) or '-'}")
+        for issue in result["issues"]:
+            print(f"- Issue: {issue}")
+    return 0 if result["compatible"] else 2
 
 
 def command_get_logtime(client: BecaClient, args: argparse.Namespace) -> int:
@@ -1967,7 +2345,12 @@ def command_verify_logtime(client: BecaClient, args: argparse.Namespace) -> int:
         "Congviec": args.work_id,
         "Ngay": f"{log_date.isoformat()} 00:00:00",
         "SoGio": api_number_text(args.hours) if args.hours is not None else None,
-        "Mota": html_description(args.description) if args.description else None,
+        "Mota": structured_description(
+            args.description,
+            getattr(args, "result", None),
+            getattr(args, "blockers", None),
+            getattr(args, "next_step", None),
+        ) if args.description else None,
         "Email": user.get("email"),
         "UserId": normalize_user_id(user.get("id")),
     }
@@ -2055,7 +2438,10 @@ def add_common_logtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--date", help="YYYY-MM-DD; defaults to previous business day")
     parser.add_argument("--hours", default="8")
     parser.add_argument("--action", default="Thực hiện")
-    parser.add_argument("--description", required=True)
+    parser.add_argument("--description", required=True, help="Đã thực hiện; HTML is accepted for legacy callers")
+    parser.add_argument("--result", help="Kết quả")
+    parser.add_argument("--blockers", help="Vướng mắc")
+    parser.add_argument("--next-step", dest="next_step", help="Bước tiếp theo")
     parser.add_argument("--allow-duplicate", action="store_true")
 
 
@@ -2065,6 +2451,9 @@ def add_update_logtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hours")
     parser.add_argument("--action")
     parser.add_argument("--description")
+    parser.add_argument("--result", help="Kết quả; requires --description")
+    parser.add_argument("--blockers", help="Vướng mắc; requires --description")
+    parser.add_argument("--next-step", dest="next_step", help="Bước tiếp theo; requires --description")
     parser.add_argument("--allow-duplicate", action="store_true")
 
 
@@ -2075,6 +2464,9 @@ def add_verify_logtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-user-workflow-id")
     parser.add_argument("--hours")
     parser.add_argument("--description")
+    parser.add_argument("--result")
+    parser.add_argument("--blockers")
+    parser.add_argument("--next-step", dest="next_step")
 
 
 def add_status_target_args(parser: argparse.ArgumentParser) -> None:
@@ -2105,12 +2497,35 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--json", action="store_true")
     list_parser.set_defaults(func=command_list_tasks)
 
+    contracts_parser = subparsers.add_parser(
+        "check-contracts",
+        help="Read current logtime form metadata and fail if the supported contract changed",
+    )
+    contracts_parser.add_argument("--json", action="store_true")
+    contracts_parser.set_defaults(func=command_check_contracts)
+
     logtimes_parser = subparsers.add_parser("list-logtimes", help="List personal logtime rows for a day")
     logtimes_parser.add_argument("--date", help="YYYY-MM-DD; defaults to previous business day")
     logtimes_parser.add_argument("--project-id", default="-1")
     logtimes_parser.add_argument("--department", help="Department id; defaults to current user's department")
     logtimes_parser.add_argument("--json", action="store_true")
     logtimes_parser.set_defaults(func=command_list_logtimes)
+
+    comments_parser = subparsers.add_parser(
+        "list-comments",
+        help="List comments added or modified since a date on active assigned tasks",
+    )
+    comments_parser.add_argument("--since", help="YYYY-MM-DD; defaults to previous business day")
+    comments_parser.add_argument("--work-id", help="Read one task instead of all active assigned tasks")
+    comments_parser.add_argument("--type", default="Xử lý")
+    comments_parser.add_argument("--rows", type=int, default=200)
+    comments_parser.add_argument(
+        "--show-sensitive",
+        action="store_true",
+        help="Disable default credential/token redaction in comment text",
+    )
+    comments_parser.add_argument("--json", action="store_true")
+    comments_parser.set_defaults(func=command_list_comments)
 
     get_logtime_parser = subparsers.add_parser("get-logtime", help="Read one logtime row by log id")
     get_logtime_parser.add_argument("--log-id", required=True)
@@ -2132,7 +2547,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--entry",
         action="append",
         default=[],
-        help='Use "task query | hours | description [| progress=28]"',
+        help='Use "task | hours | description [| result=... | blockers=... | next=... | progress=28]"',
     )
     daily_parser.add_argument("--date", help="YYYY-MM-DD; defaults to previous business day")
     daily_parser.add_argument("--allow-duplicate", action="store_true")

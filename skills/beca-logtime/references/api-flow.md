@@ -2,10 +2,18 @@
 
 This reference documents the observed BecaWork flow for `https://work.becawork.vn`.
 
+## Contents
+
+- Discovery and authentication
+- Task, comment, and timesheet reads
+- Logtime form metadata and validation
+- Save, daily batch, and update flows
+- Task status and progress
+
 ## Discovery URLs
 
-- Swagger UI: `https://work.becawork.vn/swagger`
-- OpenAPI JSON: `https://work.becawork.vn/swagger/v1/swagger.json`
+- As observed on 2026-09-11, `/swagger`, `/swagger/index.html`, and `/swagger/v1/swagger.json` return the Work SPA HTML after authentication rather than Swagger/OpenAPI. Do not treat them as a contract source.
+- Use the read-only `check-contracts` command plus live preflight calls to detect supported form-contract drift.
 - Work pages:
   - `/work`
   - `/work/mywork`
@@ -13,7 +21,7 @@ This reference documents the observed BecaWork flow for `https://work.becawork.v
 
 ## Authentication
 
-Use `BECA_COOKIE` when supplied. For interactive login, start at SSO with:
+Use `BECA_COOKIE` when supplied. Scope an explicitly supplied cookie to the Work host and strip it on cross-host redirects; never forward it to SSO. For interactive login, start at SSO with:
 
 - host: `https://sso.becawork.vn`
 - client id: `vwork.work`
@@ -91,6 +99,8 @@ Read list-view logtime rows:
 GET /api/Default/Work_TimeSheetPersonalLayoutList?date={YYYY-MM-DD}&projectId=-1&email=P:{userId}&department={departmentId}
 ```
 
+Despite the `date` parameter, the observed response can contain many rows from the surrounding period/month. `list-logtimes --date` must flatten the response and filter normalized `Ngay`/`DateLogtime` to the exact requested date.
+
 Read one logtime row:
 
 ```text
@@ -104,6 +114,14 @@ Important logtime identifiers:
 - `Congviec`: work/task id being logged; do not use this as the update row id.
 - `Duan`: project id.
 
+Read task comments:
+
+```text
+GET /api/Default/Work_GetComment?workId={workId}
+```
+
+The response is a list of `CommentModel` rows. Relevant fields are `id`, `workId`, `workName`, `fullName`, `note`, and `lastModified`. Treat `note` as HTML-capable content and render it as plain text for daily summaries. Redact credential-like values by default; reveal them only with explicit `--show-sensitive`. `list-comments --since YYYY-MM-DD` scans active assigned tasks and filters by the local calendar date from `lastModified`.
+
 ## Logtime Form
 
 Load settings:
@@ -116,6 +134,8 @@ Use:
 
 - `id_getWorkFormLogTime.id` as `formId` (observed `101`)
 - `id_getWorkFormLogTimeStep.id` as `stepId` (observed `415`)
+
+Fail closed when either value is missing. Never fall back to the observed numbers because they are workflow configuration, not constants.
 
 Load form format:
 
@@ -138,9 +158,9 @@ Relevant fields:
 - `Duan`: required project id
 - `Congviec`: required work id, filtered by `Duan`
 - `Ngay`: required log date
-- `SoGio`: required hours
+- `SoGio`: required number; observed minimum `1`, maximum `16`, and `numberOfDecimalPlaces=0`
 - `Hanhdong`: required select, observed options `Thực hiện`, `Xem xét`, `Kiểm thử`, `Theo dõi`
-- `Mota`: description as HTML
+- `Mota`: optional description as HTML. Its observed `defaultValue` is a four-item list: `Đã thực hiện`, `Kết quả`, `Vướng mắc`, and `Bước tiếp theo`.
 - `UserId`: current person id such as `P:10000`
 
 ## Validation
@@ -158,6 +178,7 @@ Observed behavior:
 - Negative number means the entry must be blocked.
 - For update, pass `oldVal={existing SoGio}` when the date is unchanged.
 - For update with changed date, pass `oldVal=0`, matching the frontend `ModalLogTime` behavior.
+- `newVal` and `oldVal` currently bind as whole hours. Decimal input such as `0.5` returns HTTP 400. Validate the live `SoGio` metadata before calling this endpoint.
 
 Check duplicates for the selected work:
 
@@ -194,7 +215,7 @@ Payload shape:
     {"name": "Ngay", "value": "2026-07-01 00:00:00"},
     {"name": "SoGio", "value": "8"},
     {"name": "Hanhdong", "value": "Thực hiện"},
-    {"name": "Mota", "value": "<p>Worked on Public Wifi backend</p>"},
+    {"name": "Mota", "value": "<ul><li><p><em>Đã thực hiện</em>: Developed API</p></li><li><p><em>Kết quả</em>: API passed</p></li><li><p><em>Vướng mắc</em>: </p></li><li><p><em>Bước tiếp theo</em>: Deploy</p></li></ul>"},
     {"name": "UserId", "value": "P:10000"}
   ],
   "data_json": "{\"Nguoilap\":\"...\"}",
@@ -229,13 +250,13 @@ Task resolution:
 Entry format:
 
 ```text
-TASK | HOURS | DESCRIPTION
-TASK | HOURS | DESCRIPTION | progress=VALUE
+TASK | HOURS | ĐÃ THỰC HIỆN
+TASK | HOURS | ĐÃ THỰC HIỆN | result=... | blockers=... | next=... | progress=VALUE
 ```
 
 Batch validation before any save:
 
-- Sum all entry hours and require exactly `8`.
+- Require each entry to use whole hours within the live `SoGio` range. Sum all entry hours and require exactly `8`.
 - Call `Work_CheckOverInLogtime?newVal=8&oldVal=0&day={YYYY-MM-DD}&isCheckin=false`; block negative responses.
 - Prepare each logtime payload with the same add flow and run per-task duplicate checks.
 - Block duplicate work ids inside the same daily batch unless duplicate override was explicitly requested.
@@ -321,7 +342,7 @@ Important fields:
 - `status`: current status workflow id, for example `1330831`.
 - `statusName`: display name, for example `Open`.
 - `statusType`: status category, for example `Cơ bản`.
-- `progress`: percent done text, for example `28%`, `70%`, or `80`.
+- `progress`: percent done text with or without a percent suffix, for example `28%`, `70%`, or `65`.
 
 List valid status transitions:
 

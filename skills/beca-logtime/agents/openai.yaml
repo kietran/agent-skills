@@ -1,4 +1,4 @@
 interface:
   display_name: "BecaWork Logtime"
-  short_description: "Preview and submit daily BecaWork logtime batches, edit rows, and update task status/progress"
-  default_prompt: "Use $beca-logtime daily for a normal 8h BecaWork logtime batch: map task names, preview once, submit only after confirmation, then verify through the API."
+  short_description: "Manage BecaWork logtime, tasks, and comments"
+  default_prompt: "Use $beca-logtime to check assigned tasks, recent comments, and logtime before preparing any confirmed updates."
