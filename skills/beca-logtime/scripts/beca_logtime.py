@@ -7,24 +7,29 @@ import getpass
 import html.parser
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http.cookiejar import CookieJar
+from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener
-from zoneinfo import ZoneInfo
 
 
 WORK_ORIGIN = "https://work.becawork.vn"
 SSO_ORIGIN = "https://sso.becawork.vn"
 USER_AGENT = "Mozilla/5.0"
-LOCAL_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+LOCAL_TIMEZONE = timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
+MIN_PYTHON = (3, 11)
+CLI_VERSION = "2.0.0"
+CONFIG_SCHEMA_VERSION = 1
+KEYRING_SERVICE = "beca-logtime"
 LOGIN_URL = (
     "https://sso.becawork.vn/Account/Login?"
     "ReturnUrl=%2Fconnect%2Fauthorize%2Fcallback%3Fclient_id%3Dvwork.work"
@@ -36,7 +41,31 @@ LOGIN_URL = (
 
 
 class BecaError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "BECA_ERROR",
+        hint: str | None = None,
+        data_changed: bool = False,
+        exit_code: int = 1,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+        self.data_changed = data_changed
+        self.exit_code = exit_code
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": {
+                "code": self.code,
+                "message": str(self),
+                "hint": self.hint,
+                "dataChanged": self.data_changed,
+            },
+        }
 
 
 class SameOriginRedirectHandler(HTTPRedirectHandler):
@@ -49,21 +78,108 @@ class SameOriginRedirectHandler(HTTPRedirectHandler):
         return redirected
 
 
+@dataclass
+class HtmlForm:
+    action: str
+    method: str
+    inputs: dict[str, str]
+    input_types: dict[str, str]
+
+
 class FormParser(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self.action = ""
-        self.inputs: dict[str, str] = {}
+        self.forms: list[HtmlForm] = []
+        self._current: HtmlForm | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
-        if tag == "form" and not self.action:
-            self.action = values.get("action") or ""
+        if tag == "form":
+            self._current = HtmlForm(
+                action=values.get("action") or "",
+                method=(values.get("method") or "post").lower(),
+                inputs={},
+                input_types={},
+            )
+            self.forms.append(self._current)
             return
-        if tag == "input":
+        if tag == "input" and self._current is not None:
             name = values.get("name")
             if name:
-                self.inputs[name] = values.get("value") or ""
+                self._current.inputs[name] = values.get("value") or ""
+                self._current.input_types[name] = (values.get("type") or "text").lower()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form":
+            self._current = None
+
+    @property
+    def action(self) -> str:
+        return self.forms[0].action if self.forms else ""
+
+    @property
+    def inputs(self) -> dict[str, str]:
+        return self.forms[0].inputs if self.forms else {}
+
+
+class TextParser(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if text:
+            self.parts.append(text)
+
+
+def parse_forms(document: str) -> list[HtmlForm]:
+    parser = FormParser()
+    parser.feed(document)
+    return parser.forms
+
+
+def absolute_form_action(form: HtmlForm, base_url: str) -> str:
+    return urljoin(base_url, form.action or base_url)
+
+
+def is_login_form(form: HtmlForm, base_url: str) -> bool:
+    action = urlparse(absolute_form_action(form, base_url)).path.casefold()
+    has_password = any(value == "password" for value in form.input_types.values())
+    return has_password or "account/login" in action
+
+
+def is_callback_form(form: HtmlForm, base_url: str) -> bool:
+    target = urlparse(absolute_form_action(form, base_url))
+    fields = {name.casefold() for name in form.inputs}
+    has_oidc_fields = bool(fields & {"code", "id_token", "state", "session_state"})
+    return target.netloc.casefold() == urlparse(WORK_ORIGIN).netloc.casefold() and target.path.rstrip("/").casefold().endswith("/signin-oidc") and has_oidc_fields
+
+
+def is_auth_challenge(document: str, forms: list[HtmlForm]) -> bool:
+    field_names = {name.casefold() for form in forms for name in form.inputs}
+    if field_names & {"otp", "totp", "captcha", "verificationcode", "verification_code"}:
+        return True
+    lowered = document.casefold()
+    return any(marker in lowered for marker in ("captcha", "one-time password", "verification code", "mã xác minh", "xác thực hai"))
+
+
+def safe_auth_message(document: str) -> str | None:
+    parser = TextParser()
+    parser.feed(document)
+    text = " ".join(parser.parts).casefold()
+    messages = (
+        ("locked", "Tài khoản BecaWork có thể đang bị khóa."),
+        ("khóa", "Tài khoản BecaWork có thể đang bị khóa."),
+        ("invalid username or password", "Tài khoản hoặc mật khẩu chưa đúng."),
+        ("incorrect username or password", "Tài khoản hoặc mật khẩu chưa đúng."),
+        ("tài khoản hoặc mật khẩu", "Tài khoản hoặc mật khẩu chưa đúng."),
+        ("đăng nhập không thành công", "Đăng nhập BecaWork chưa thành công."),
+    )
+    for marker, message in messages:
+        if marker in text:
+            return message
+    return None
 
 
 def kwallet_lookup(entry: str) -> str | None:
@@ -107,6 +223,155 @@ def secret_tool_lookup(attributes: dict[str, str]) -> str | None:
         return None
     value = result.stdout.rstrip("\n")
     return value or None
+
+
+def config_dir(
+    platform_name: str | None = None,
+    environment: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    env = environment if environment is not None else dict(os.environ)
+    override = env.get("BECA_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
+    current_platform = platform_name or sys.platform
+    user_home = home or Path.home()
+    if current_platform.startswith("win"):
+        return Path(env.get("APPDATA") or user_home / "AppData" / "Roaming") / "beca-logtime"
+    if current_platform == "darwin":
+        return user_home / "Library" / "Application Support" / "beca-logtime"
+    return Path(env.get("XDG_CONFIG_HOME") or user_home / ".config") / "beca-logtime"
+
+
+def config_file(**kwargs: Any) -> Path:
+    return config_dir(**kwargs) / "config.json"
+
+
+def load_config(path: Path | None = None) -> dict[str, Any]:
+    target = path or config_file()
+    if not target.exists():
+        return {}
+    try:
+        value = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BecaError(
+            "Không thể đọc cấu hình BecaWork.",
+            code="CONFIG_INVALID",
+            hint=f"Kiểm tra hoặc chạy reset-auth cho {target}.",
+        ) from exc
+    if not isinstance(value, dict) or value.get("schemaVersion") != CONFIG_SCHEMA_VERSION:
+        raise BecaError(
+            "Phiên bản cấu hình BecaWork không tương thích.",
+            code="CONFIG_INVALID",
+            hint="Chạy reset-auth rồi thiết lập lại BecaWork.",
+        )
+    return value
+
+
+def save_config(value: dict[str, Any], path: Path | None = None) -> Path:
+    target = path or config_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    payload = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        if os.name != "nt":
+            temporary.chmod(0o600)
+        os.replace(temporary, target)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise BecaError(
+            "Không thể lưu cấu hình BecaWork.",
+            code="CONFIG_WRITE_FAILED",
+            hint=f"Kiểm tra quyền ghi tại {target.parent}.",
+        ) from exc
+    return target
+
+
+def keyring_module():
+    try:
+        import keyring  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    return keyring
+
+
+def keyring_backend_status() -> dict[str, Any]:
+    keyring = keyring_module()
+    if keyring is None:
+        return {
+            "available": False,
+            "backend": None,
+            "message": "Python keyring chưa được cài đặt.",
+        }
+    try:
+        backend = keyring.get_keyring()
+        priority = getattr(backend, "priority", 0)
+        viable = bool(priority and float(priority) > 0)
+        return {
+            "available": viable,
+            "backend": f"{backend.__class__.__module__}.{backend.__class__.__name__}",
+            "message": None if viable else "Không có keyring backend an toàn khả dụng.",
+        }
+    except Exception as exc:  # keyring has backend-specific exception types
+        return {
+            "available": False,
+            "backend": None,
+            "message": f"Keyring không khả dụng: {exc.__class__.__name__}.",
+        }
+
+
+def keyring_lookup(username: str) -> str | None:
+    keyring = keyring_module()
+    if keyring is None:
+        return None
+    try:
+        return keyring.get_password(KEYRING_SERVICE, username)
+    except Exception:
+        return None
+
+
+def keyring_store(username: str, password: str) -> None:
+    keyring = keyring_module()
+    status = keyring_backend_status()
+    if keyring is None or not status["available"]:
+        raise BecaError(
+            "Không có credential store an toàn để lưu mật khẩu.",
+            code="KEYRING_UNAVAILABLE",
+            hint="Cài package keyring hoặc tiếp tục với --no-store.",
+        )
+    try:
+        keyring.set_password(KEYRING_SERVICE, username, password)
+    except Exception as exc:
+        raise BecaError(
+            "Không thể lưu mật khẩu vào credential store của hệ điều hành.",
+            code="KEYRING_WRITE_FAILED",
+            hint="Cho phép truy cập keychain/credential manager hoặc dùng --no-store.",
+        ) from exc
+
+
+def keyring_delete(username: str) -> bool:
+    keyring = keyring_module()
+    if keyring is None:
+        return False
+    try:
+        keyring.delete_password(KEYRING_SERVICE, username)
+        return True
+    except Exception:
+        return False
+
+
+def setup_config(username: str, backend: str) -> dict[str, Any]:
+    return {
+        "schemaVersion": CONFIG_SCHEMA_VERSION,
+        "username": username,
+        "credentialBackend": backend,
+        "setupCompletedAt": datetime.now(LOCAL_TIMEZONE).isoformat(),
+        "lastVerifiedVersion": CLI_VERSION,
+    }
 
 
 @dataclass
@@ -185,36 +450,70 @@ class BecaClient:
             HTTPCookieProcessor(CookieJar()),
         )
         self._xsrf_token: str | None = None
+        self.auth_source: str | None = "cookie" if cookie else None
+        self.authenticated_user: dict[str, Any] | None = None
 
-    def ensure_auth(self) -> None:
+    def ensure_auth(self, interactive: bool = True) -> None:
         if self.cookie:
+            self.verify_login()
             return
+        config = load_config()
         username = (
             os.getenv("BECA_USERNAME")
+            or str(config.get("username") or "").strip()
             or secret_tool_lookup({"service": "becawork", "kind": "username"})
             or kwallet_lookup("username")
         )
         if not username:
+            if not interactive or not sys.stdin.isatty():
+                raise BecaError(
+                    "BecaWork chưa được thiết lập trên máy này.",
+                    code="SETUP_REQUIRED",
+                    hint="Chạy setup trong terminal tương tác.",
+                    exit_code=2,
+                )
             username = input("BecaWork username: ")
 
-        password = os.getenv("BECA_PASSWORD") or secret_tool_lookup(
-            {"service": "becawork", "kind": "password", "username": username}
-        ) or kwallet_lookup("password")
+        password = os.getenv("BECA_PASSWORD")
+        if password:
+            self.auth_source = "environment"
         if not password:
+            password = keyring_lookup(username)
+            if password:
+                self.auth_source = "keyring"
+        if not password:
+            password = secret_tool_lookup(
+                {"service": "becawork", "kind": "password", "username": username}
+            ) or kwallet_lookup("password")
+            if password:
+                self.auth_source = "legacy-linux"
+        if not password:
+            if not interactive or not sys.stdin.isatty():
+                raise BecaError(
+                    "Không tìm thấy credential BecaWork cho tài khoản đã cấu hình.",
+                    code="SETUP_REQUIRED",
+                    hint="Chạy setup trong terminal tương tác để đăng nhập lại.",
+                    exit_code=2,
+                )
             password = getpass.getpass("BecaWork password: ")
+            self.auth_source = "interactive"
         self.login(username, password)
 
     def login(self, username: str, password: str) -> None:
-        login_page = self._open(Request(LOGIN_URL, headers=self._headers()))
+        login_page = self._open(Request(LOGIN_URL, headers=self._headers(target_url=LOGIN_URL)))
         login_html = login_page.read().decode("utf-8", errors="replace")
 
-        parser = FormParser()
-        parser.feed(login_html)
-        if not parser.inputs:
-            raise BecaError("Could not find login form on SSO page.")
+        login_forms = parse_forms(login_html)
+        login_form = next((form for form in login_forms if is_login_form(form, login_page.geturl())), None)
+        if login_form is None:
+            raise BecaError(
+                "Không tìm thấy form đăng nhập BecaWork.",
+                code="AUTH_FLOW_CHANGED",
+                hint="SSO có thể vừa thay đổi; chạy doctor --debug và báo cho người duy trì skill.",
+            )
 
         form_data = {
-            **parser.inputs,
+            **login_form.inputs,
             "Username": username,
             "Password": password,
             "Input.Username": username,
@@ -222,23 +521,60 @@ class BecaClient:
             "RememberMe": "false",
             "button": "login",
         }
+        login_action = absolute_form_action(login_form, login_page.geturl())
         response = self._open(
             Request(
-                LOGIN_URL,
+                login_action,
                 data=urlencode(form_data).encode("utf-8"),
                 headers=self._headers(
                     {
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Origin": SSO_ORIGIN,
                         "Referer": LOGIN_URL,
-                    }
+                    },
+                    target_url=login_action,
                 ),
                 method="POST",
             )
         )
         body = response.read().decode("utf-8", errors="replace")
-        if "<form" in body and "signin-oidc" in body:
-            self._submit_html_form(body, response.geturl())
+        forms = parse_forms(body)
+        callback = next((form for form in forms if is_callback_form(form, response.geturl())), None)
+        if callback is not None:
+            self._submit_form(callback, response.geturl())
+            self.authenticated_user = self.verify_login()
+            return
+        if is_auth_challenge(body, forms):
+            raise BecaError(
+                "BecaWork yêu cầu một bước xác minh bổ sung.",
+                code="AUTH_CHALLENGE_REQUIRED",
+                hint="Skill v2 chưa tự động hóa MFA/CAPTCHA; hãy đăng nhập trên trình duyệt hoặc liên hệ người duy trì skill.",
+            )
+        if any(is_login_form(form, response.geturl()) for form in forms) or "Account/Login" in response.geturl():
+            raise BecaError(
+                safe_auth_message(body) or "Đăng nhập BecaWork chưa thành công.",
+                code="AUTH_INVALID",
+                hint="Kiểm tra tài khoản hoặc mật khẩu và thử lại.",
+            )
+        try:
+            self.authenticated_user = self.verify_login()
+        except BecaError as exc:
+            raise BecaError(
+                "Không xác minh được phiên đăng nhập BecaWork.",
+                code="AUTH_FLOW_CHANGED",
+                hint="SSO có thể vừa thay đổi; chạy doctor --debug và báo cho người duy trì skill.",
+            ) from exc
+
+    def verify_login(self) -> dict[str, Any]:
+        user = self.get_json("/api/Default/Work_GetInfLogin", {"IsMobile": "false"})
+        if not isinstance(user, dict) or not any(user.get(key) for key in ("id", "email", "fullName")):
+            raise BecaError(
+                "BecaWork không trả về thông tin tài khoản hợp lệ.",
+                code="AUTH_VERIFY_FAILED",
+                hint="Chạy setup hoặc doctor để đăng nhập lại.",
+            )
+        self.authenticated_user = user
+        return user
 
     def get_json(self, path_or_url: str, params: dict[str, Any] | None = None) -> Any:
         url = self._url(path_or_url, params)
@@ -306,35 +642,56 @@ class BecaClient:
         method: str = "GET",
     ) -> str:
         response = self._open(
-            Request(url, data=data, headers=self._headers(headers), method=method)
+            Request(url, data=data, headers=self._headers(headers, target_url=url), method=method)
         )
         body = response.read().decode("utf-8", errors="replace")
-        if "<form" in body and "signin-oidc" in body:
-            self._submit_html_form(body, response.geturl())
+        forms = parse_forms(body)
+        callback = next((form for form in forms if is_callback_form(form, response.geturl())), None)
+        if callback is not None:
+            self._submit_form(callback, response.geturl())
             response = self._open(
-                Request(url, data=data, headers=self._headers(headers), method=method)
+                Request(url, data=data, headers=self._headers(headers, target_url=url), method=method)
             )
             body = response.read().decode("utf-8", errors="replace")
-        if "Account/Login" in response.geturl() and "<form" in body:
-            raise BecaError("BecaWork session is not authenticated. Refresh BECA_COOKIE or login again.")
+            forms = parse_forms(body)
+        if is_auth_challenge(body, forms):
+            raise BecaError(
+                "BecaWork yêu cầu một bước xác minh bổ sung.",
+                code="AUTH_CHALLENGE_REQUIRED",
+                hint="Đăng nhập lại trên trình duyệt hoặc liên hệ người duy trì skill.",
+            )
+        if "Account/Login" in response.geturl() or any(is_login_form(form, response.geturl()) for form in forms):
+            raise BecaError(
+                "Phiên BecaWork chưa được xác thực hoặc đã hết hạn.",
+                code="AUTH_REQUIRED",
+                hint="Chạy setup để đăng nhập lại.",
+            )
         return body
 
     def _submit_html_form(self, html: str, base_url: str) -> str:
-        parser = FormParser()
-        parser.feed(html)
-        if not parser.action or not parser.inputs:
-            raise BecaError("Could not submit authentication callback form.")
-        action = urljoin(base_url, parser.action)
+        forms = parse_forms(html)
+        form = next((item for item in forms if is_callback_form(item, base_url)), None)
+        if form is None:
+            raise BecaError(
+                "Không tìm thấy callback form hợp lệ của BecaWork.",
+                code="AUTH_FLOW_CHANGED",
+                hint="SSO có thể vừa thay đổi; chạy doctor --debug và báo cho người duy trì skill.",
+            )
+        return self._submit_form(form, base_url)
+
+    def _submit_form(self, form: HtmlForm, base_url: str) -> str:
+        action = absolute_form_action(form, base_url)
         response = self._open(
             Request(
                 action,
-                data=urlencode(parser.inputs).encode("utf-8"),
+                data=urlencode(form.inputs).encode("utf-8"),
                 headers=self._headers(
                     {
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Origin": origin_for(action),
                         "Referer": base_url,
-                    }
+                    },
+                    target_url=action,
                 ),
                 method="POST",
             )
@@ -345,16 +702,31 @@ class BecaClient:
         try:
             return self.opener.open(request, timeout=30)
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise BecaError(f"HTTP {exc.code} for {request.full_url}: {body[:500]}") from exc
+            raise BecaError(
+                f"BecaWork trả về HTTP {exc.code}.",
+                code="HTTP_ERROR",
+                hint=f"Kiểm tra kết nối hoặc chạy doctor. Endpoint: {urlparse(request.full_url).path}",
+            ) from exc
+        except URLError as exc:
+            raise BecaError(
+                "Không thể kết nối tới BecaWork.",
+                code="NETWORK_ERROR",
+                hint="Kiểm tra Internet, VPN, proxy hoặc DNS rồi chạy doctor.",
+            ) from exc
 
-    def _headers(self, headers: dict[str, str] | None = None) -> dict[str, str]:
+    def _headers(
+        self,
+        headers: dict[str, str] | None = None,
+        target_url: str | None = None,
+    ) -> dict[str, str]:
         merged = {
             "Accept": "application/json",
             "User-Agent": USER_AGENT,
             **(headers or {}),
         }
-        if self.cookie:
+        target_host = urlparse(target_url or WORK_ORIGIN).netloc.casefold()
+        work_host = urlparse(WORK_ORIGIN).netloc.casefold()
+        if self.cookie and target_host == work_host:
             merged["Cookie"] = self.cookie
         return merged
 
@@ -369,7 +741,11 @@ class BecaClient:
         try:
             return json.loads(body)
         except json.JSONDecodeError as exc:
-            raise BecaError(f"Response from {url} is not JSON: {body[:500]}") from exc
+            raise BecaError(
+                f"BecaWork trả về dữ liệu không hợp lệ cho {urlparse(url).path}.",
+                code="INVALID_RESPONSE",
+                hint="Phiên đăng nhập có thể đã hết hạn hoặc API vừa thay đổi; chạy doctor.",
+            ) from exc
 
 
 def origin_for(url: str) -> str:
@@ -2171,6 +2547,295 @@ def print_comments(rows: list[dict[str, Any]], as_json: bool) -> None:
         )
 
 
+def runtime_supported() -> bool:
+    return sys.version_info[:2] >= MIN_PYTHON
+
+
+def user_identity(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": user.get("id"),
+        "fullName": user.get("fullName") or user.get("name"),
+        "email": user.get("email"),
+        "departmentId": user.get("departmentId") or user.get("department"),
+    }
+
+
+def active_task_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        title=None,
+        project_name=None,
+        type="Xử lý",
+        page=1,
+        rows=200,
+        mine_only=True,
+        json=False,
+    )
+
+
+def command_version(_client: BecaClient, args: argparse.Namespace) -> int:
+    result = {
+        "version": CLI_VERSION,
+        "configSchema": CONFIG_SCHEMA_VERSION,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "minimumPython": ".".join(map(str, MIN_PYTHON)),
+    }
+    if args.json:
+        print_json(result)
+    else:
+        print(f"BecaWork Logtime {CLI_VERSION}")
+        print(f"- Python: {result['python']} (minimum {result['minimumPython']})")
+        print(f"- Platform: {result['platform']}")
+        print(f"- Config schema: {CONFIG_SCHEMA_VERSION}")
+    return 0
+
+
+def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
+    if not runtime_supported():
+        raise BecaError(
+            f"BecaWork Logtime cần Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} trở lên.",
+            code="PYTHON_UNSUPPORTED",
+            hint="Cài Python 3.11+ rồi chạy lại setup.",
+        )
+    try:
+        existing = load_config()
+    except BecaError as exc:
+        if exc.code != "CONFIG_INVALID":
+            raise
+        existing = {}
+    username = str(
+        args.username
+        or os.getenv("BECA_USERNAME")
+        or existing.get("username")
+        or secret_tool_lookup({"service": "becawork", "kind": "username"})
+        or kwallet_lookup("username")
+        or ""
+    ).strip()
+    if not username:
+        if not sys.stdin.isatty():
+            raise BecaError(
+                "Setup cần terminal tương tác để nhập tài khoản.",
+                code="SETUP_REQUIRES_TTY",
+                hint="Mở terminal rồi chạy setup, hoặc truyền --username.",
+                exit_code=2,
+            )
+        username = input("BecaWork username: ").strip()
+    if not username:
+        raise BecaError("Username không được để trống.", code="SETUP_INVALID")
+
+    password = os.getenv("BECA_PASSWORD")
+    source = "environment" if password else None
+    if not password:
+        password = keyring_lookup(username)
+        source = "keyring" if password else None
+    if not password:
+        password = secret_tool_lookup(
+            {"service": "becawork", "kind": "password", "username": username}
+        ) or kwallet_lookup("password")
+        source = "legacy-linux" if password else None
+    entered_password = False
+    if not password:
+        if not sys.stdin.isatty():
+            raise BecaError(
+                "Setup cần terminal tương tác để nhập mật khẩu an toàn.",
+                code="SETUP_REQUIRES_TTY",
+                hint="Mở terminal tương tác và chạy lại setup.",
+                exit_code=2,
+            )
+        password = getpass.getpass("BecaWork password: ")
+        entered_password = True
+        source = "interactive"
+    if not password:
+        raise BecaError("Password không được để trống.", code="SETUP_INVALID")
+
+    client.login(username, password)
+    user = client.authenticated_user or client.verify_login()
+    contract = inspect_logtime_contract(client)
+    tasks = list_tasks(client, active_task_args())
+
+    credential_backend = "session" if entered_password else (source or "session")
+    keyring_status = keyring_backend_status()
+    keyring_result = dict(keyring_status)
+    if entered_password and not args.no_store and keyring_status["available"]:
+        remember = True
+        if sys.stdin.isatty():
+            answer = input("Lưu mật khẩu an toàn trong credential store? [Y/n]: ").strip().lower()
+            remember = answer not in {"n", "no"}
+        if remember:
+            keyring_store(username, password)
+            credential_backend = "keyring"
+            keyring_result = {**keyring_status, "stored": True}
+    elif entered_password and not args.no_store and not keyring_status["available"]:
+        keyring_result = {**keyring_status, "stored": False}
+
+    config_target = save_config(setup_config(username, credential_backend))
+    result = {
+        "ok": bool(contract.get("compatible")),
+        "version": CLI_VERSION,
+        "configPath": str(config_target),
+        "credentialBackend": credential_backend,
+        "keyring": keyring_result,
+        "user": user_identity(user),
+        "activeTaskCount": len(tasks),
+        "contractCompatible": bool(contract.get("compatible")),
+        "dataChanged": False,
+    }
+    if args.json:
+        print_json(result)
+    else:
+        print("BecaWork setup")
+        print(f"- Python: OK ({platform.python_version()})")
+        print(f"- Platform: OK ({platform.system()})")
+        print(f"- Login: OK ({result['user'].get('fullName') or result['user'].get('email') or username})")
+        print(f"- Active tasks: {len(tasks)}")
+        print(f"- API contract: {'OK' if result['contractCompatible'] else 'INCOMPATIBLE'}")
+        if entered_password and not args.no_store and not keyring_status["available"]:
+            print("- Credential: session only (install optional package 'keyring' to remember securely)")
+        else:
+            print(f"- Credential: {credential_backend}")
+        print("Setup hoàn tất. Chưa có dữ liệu BecaWork nào được thay đổi.")
+    return 0 if result["ok"] else 2
+
+
+def command_doctor(client: BecaClient, args: argparse.Namespace) -> int:
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, status: str, message: str, hint: str | None = None) -> None:
+        item: dict[str, Any] = {"name": name, "status": status, "message": message}
+        if hint:
+            item["hint"] = hint
+        checks.append(item)
+
+    if runtime_supported():
+        add("python", "ok", f"Python {platform.python_version()}")
+    else:
+        add("python", "error", f"Python {platform.python_version()}", "Cài Python 3.11+.")
+    add("platform", "ok", platform.platform())
+    target = config_file()
+    try:
+        config = load_config(target)
+        if config:
+            add("config", "ok", str(target))
+        else:
+            add("config", "warning", "Chưa có cấu hình.", "Chạy setup.")
+    except BecaError as exc:
+        config = {}
+        add("config", "error", str(exc), exc.hint)
+    keyring_info = keyring_backend_status()
+    add(
+        "keyring",
+        "ok" if keyring_info["available"] else "warning",
+        keyring_info.get("message") or str(keyring_info.get("backend")),
+        None if keyring_info["available"] else "Có thể cài package tùy chọn 'keyring'.",
+    )
+    try:
+        response = client._open(
+            Request(LOGIN_URL, headers=client._headers(target_url=LOGIN_URL))
+        )
+        response.read(1)
+        add("network", "ok", "Kết nối được BecaWork SSO.")
+    except BecaError as exc:
+        add("network", "error", str(exc), exc.hint)
+
+    authenticated = False
+    try:
+        client.ensure_auth(interactive=False)
+        user = client.authenticated_user or client.verify_login()
+        add("authentication", "ok", str(user_identity(user).get("email") or user_identity(user).get("fullName")))
+        authenticated = True
+    except BecaError as exc:
+        status = "warning" if exc.code == "SETUP_REQUIRED" else "error"
+        add("authentication", status, str(exc), exc.hint)
+    if authenticated:
+        try:
+            contract = inspect_logtime_contract(client)
+            add(
+                "contract",
+                "ok" if contract.get("compatible") else "error",
+                "Logtime API tương thích." if contract.get("compatible") else "Logtime API không tương thích.",
+                None if contract.get("compatible") else "Không submit cho tới khi contract được cập nhật.",
+            )
+        except BecaError as exc:
+            add("contract", "error", str(exc), exc.hint)
+    else:
+        add("contract", "skipped", "Bỏ qua vì chưa xác thực.")
+
+    ready = all(item["status"] not in {"error"} for item in checks) and authenticated
+    result = {
+        "ok": ready,
+        "ready": ready,
+        "version": CLI_VERSION,
+        "configPath": str(target),
+        "checks": checks,
+        "dataChanged": False,
+    }
+    if args.debug:
+        result["diagnostics"] = {
+            "pythonExecutable": sys.executable,
+            "pythonVersion": platform.python_version(),
+            "platform": platform.platform(),
+            "configExists": target.exists(),
+            "authSource": client.auth_source,
+            "workHost": urlparse(WORK_ORIGIN).netloc,
+            "ssoHost": urlparse(SSO_ORIGIN).netloc,
+        }
+    if args.json:
+        print_json(result)
+    else:
+        print("BecaWork doctor")
+        symbols = {"ok": "OK", "warning": "WARN", "error": "ERROR", "skipped": "SKIP"}
+        for item in checks:
+            print(f"- [{symbols[item['status']]}] {item['name']}: {item['message']}")
+            if item.get("hint"):
+                print(f"  {item['hint']}")
+        print("BecaWork đã sẵn sàng." if ready else "BecaWork chưa sẵn sàng. Chưa có dữ liệu nào được thay đổi.")
+    return 0 if ready else 2
+
+
+def command_whoami(client: BecaClient, args: argparse.Namespace) -> int:
+    user = user_identity(client.authenticated_user or client.verify_login())
+    if args.json:
+        print_json(user)
+    else:
+        print("BecaWork account")
+        print(f"- Name: {user.get('fullName') or '-'}")
+        print(f"- Email: {user.get('email') or '-'}")
+        print(f"- Department: {user.get('departmentId') or '-'}")
+    return 0
+
+
+def command_reset_auth(_client: BecaClient, args: argparse.Namespace) -> int:
+    target = config_file()
+    try:
+        config = load_config(target)
+    except BecaError:
+        config = {}
+    username = str(config.get("username") or "").strip()
+    keyring_deleted = keyring_delete(username) if username else False
+    existed = target.exists()
+    try:
+        target.unlink(missing_ok=True)
+    except OSError as exc:
+        raise BecaError(
+            "Không thể xóa cấu hình BecaWork.",
+            code="CONFIG_WRITE_FAILED",
+            hint=f"Kiểm tra quyền tại {target}.",
+        ) from exc
+    result = {
+        "ok": True,
+        "configRemoved": existed,
+        "keyringCredentialRemoved": keyring_deleted,
+        "environmentVariablesChanged": False,
+        "dataChanged": False,
+    }
+    if args.json:
+        print_json(result)
+    else:
+        print("Đã xóa cấu hình đăng nhập cục bộ của BecaWork.")
+        print("Biến môi trường và dữ liệu trên BecaWork không bị thay đổi.")
+    return 0
+
+
 def command_list_tasks(client: BecaClient, args: argparse.Namespace) -> int:
     tasks = list_tasks(client, args)
     print_tasks(tasks, args.json)
@@ -2483,9 +3148,32 @@ def add_progress_target_args(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Preview, submit, update, and verify BecaWork logtime/task state.")
+    parser = argparse.ArgumentParser(description="Set up and manage BecaWork logtime/task state.")
     parser.add_argument("--cookie", default=os.getenv("BECA_COOKIE"), help="BecaWork cookie header value")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup_parser = subparsers.add_parser("setup", help="Set up BecaWork safely on this computer")
+    setup_parser.add_argument("--username", help="BecaWork username; password is always read securely")
+    setup_parser.add_argument("--no-store", action="store_true", help="Do not store password in the OS credential store")
+    setup_parser.add_argument("--json", action="store_true")
+    setup_parser.set_defaults(func=command_setup)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Diagnose runtime, network, login, and API compatibility")
+    doctor_parser.add_argument("--json", action="store_true")
+    doctor_parser.add_argument("--debug", action="store_true", help="Include redacted diagnostic metadata")
+    doctor_parser.set_defaults(func=command_doctor)
+
+    whoami_parser = subparsers.add_parser("whoami", help="Show the authenticated BecaWork account")
+    whoami_parser.add_argument("--json", action="store_true")
+    whoami_parser.set_defaults(func=command_whoami)
+
+    reset_parser = subparsers.add_parser("reset-auth", help="Remove local BecaWork authentication settings")
+    reset_parser.add_argument("--json", action="store_true")
+    reset_parser.set_defaults(func=command_reset_auth)
+
+    version_parser = subparsers.add_parser("version", help="Show BecaWork Logtime version and runtime")
+    version_parser.add_argument("--json", action="store_true")
+    version_parser.set_defaults(func=command_version)
 
     list_parser = subparsers.add_parser("list-tasks", help="List active tasks from BecaWork")
     list_parser.add_argument("--title")
@@ -2609,8 +3297,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not runtime_supported() and args.command not in {"doctor", "version"}:
+        raise BecaError(
+            f"BecaWork Logtime cần Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} trở lên.",
+            code="PYTHON_UNSUPPORTED",
+            hint="Cài Python 3.11+ rồi thử lại.",
+        )
     client = BecaClient(cookie=args.cookie)
-    client.ensure_auth()
+    if args.command not in {"setup", "doctor", "reset-auth", "version"}:
+        try:
+            client.ensure_auth(interactive=False)
+        except BecaError as exc:
+            if exc.code != "SETUP_REQUIRED" or not sys.stdin.isatty():
+                raise
+            print("BecaWork chưa được thiết lập. Bắt đầu onboarding read-only...")
+            command_setup(
+                client,
+                argparse.Namespace(username=None, no_store=False, json=False),
+            )
     return args.func(client, args)
 
 
@@ -2618,5 +3322,11 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except BecaError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        if "--json" in sys.argv:
+            print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+        else:
+            print(f"error [{exc.code}]: {exc}", file=sys.stderr)
+            if exc.hint:
+                print(f"hint: {exc.hint}", file=sys.stderr)
+            print(f"data changed: {'yes' if exc.data_changed else 'no'}", file=sys.stderr)
+        raise SystemExit(exc.exit_code)

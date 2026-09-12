@@ -3,15 +3,19 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
 from datetime import date
+from unittest.mock import patch
 
 
 SCRIPT = pathlib.Path(__file__).with_name("beca_logtime.py")
+FIXTURES = SCRIPT.parent.parent / "tests" / "fixtures"
 SPEC = importlib.util.spec_from_file_location("beca_logtime", SCRIPT)
 assert SPEC and SPEC.loader
 beca_logtime = importlib.util.module_from_spec(SPEC)
@@ -20,6 +24,262 @@ SPEC.loader.exec_module(beca_logtime)
 
 
 class BecaLogtimeTests(unittest.TestCase):
+    def test_v2_requires_python_311_and_uses_fixed_vietnam_timezone(self) -> None:
+        self.assertEqual(beca_logtime.MIN_PYTHON, (3, 11))
+        self.assertEqual(beca_logtime.LOCAL_TIMEZONE.utcoffset(None).total_seconds(), 7 * 3600)
+
+    def test_config_paths_are_platform_native(self) -> None:
+        home = pathlib.Path("/Users/demo")
+        windows = beca_logtime.config_dir(
+            "win32", {"APPDATA": r"C:\Users\demo\AppData\Roaming"}, pathlib.Path("C:/Users/demo")
+        )
+        macos = beca_logtime.config_dir("darwin", {}, home)
+        linux = beca_logtime.config_dir("linux", {"XDG_CONFIG_HOME": "/tmp/config"}, pathlib.Path("/home/demo"))
+        self.assertEqual(windows.name, "beca-logtime")
+        self.assertIn("AppData", str(windows.parent))
+        self.assertEqual(macos, home / "Library" / "Application Support" / "beca-logtime")
+        self.assertEqual(linux, pathlib.Path("/tmp/config/beca-logtime"))
+
+    def test_config_round_trip_contains_no_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "config.json"
+            value = beca_logtime.setup_config("demo", "keyring")
+            beca_logtime.save_config(value, target)
+            loaded = beca_logtime.load_config(target)
+            self.assertEqual(loaded["username"], "demo")
+            raw = target.read_text(encoding="utf-8").casefold()
+            self.assertNotIn("password", raw)
+            self.assertNotIn("cookie", raw)
+            self.assertNotIn("token", raw)
+
+    def test_error_json_has_stable_safe_shape(self) -> None:
+        error = beca_logtime.BecaError(
+            "Login failed", code="AUTH_INVALID", hint="Try again"
+        ).as_dict()
+        self.assertEqual(error["error"]["code"], "AUTH_INVALID")
+        self.assertFalse(error["error"]["dataChanged"])
+
+    def test_form_parser_scopes_inputs_to_each_form(self) -> None:
+        forms = beca_logtime.parse_forms(
+            '<form action="/Account/Login"><input name="Input.Password" type="password"></form>'
+            '<form action="https://work.becawork.vn/signin-oidc">'
+            '<input name="code" value="demo"><input name="state" value="state-demo"></form>'
+        )
+        self.assertEqual(len(forms), 2)
+        self.assertIn("Input.Password", forms[0].inputs)
+        self.assertNotIn("code", forms[0].inputs)
+        self.assertTrue(beca_logtime.is_callback_form(forms[1], beca_logtime.SSO_ORIGIN))
+
+    def test_failed_login_page_is_not_treated_as_callback(self) -> None:
+        page = (FIXTURES / "login-invalid-password.html").read_text(encoding="utf-8")
+        forms = beca_logtime.parse_forms(page)
+        self.assertTrue(beca_logtime.is_login_form(forms[0], beca_logtime.LOGIN_URL))
+        self.assertFalse(beca_logtime.is_callback_form(forms[0], beca_logtime.LOGIN_URL))
+        self.assertEqual(beca_logtime.safe_auth_message(page), "Tài khoản hoặc mật khẩu chưa đúng.")
+
+    def test_auth_challenge_is_detected(self) -> None:
+        page = (FIXTURES / "login-mfa.html").read_text(encoding="utf-8")
+        self.assertTrue(beca_logtime.is_auth_challenge(page, beca_logtime.parse_forms(page)))
+
+    def test_login_success_submits_oidc_callback_and_verifies_identity(self) -> None:
+        class Response:
+            def __init__(self, body: str, url: str) -> None:
+                self.body = body.encode()
+                self.url = url
+
+            def read(self, _size=None):
+                return self.body
+
+            def geturl(self):
+                return self.url
+
+        class LoginClient(beca_logtime.BecaClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.requests = []
+                self.responses = [
+                    Response(
+                        (FIXTURES / "login-page.html").read_text(encoding="utf-8"),
+                        beca_logtime.LOGIN_URL,
+                    ),
+                    Response(
+                        (FIXTURES / "login-success-callback.html").read_text(encoding="utf-8"),
+                        beca_logtime.LOGIN_URL,
+                    ),
+                    Response("<html>ok</html>", "https://work.becawork.vn/"),
+                    Response(
+                        json.dumps({"id": 100, "email": "demo@example.com", "fullName": "Demo"}),
+                        "https://work.becawork.vn/api/Default/Work_GetInfLogin",
+                    ),
+                ]
+
+            def _open(self, request):
+                self.requests.append(request)
+                return self.responses.pop(0)
+
+        client = LoginClient()
+        client.login("demo", "password-demo")
+        self.assertEqual(client.authenticated_user["email"], "demo@example.com")
+        self.assertEqual(client.requests[2].full_url, "https://work.becawork.vn/signin-oidc")
+        self.assertNotIn("password-demo", client.requests[2].data.decode())
+
+    def test_login_rejection_returns_auth_invalid_instead_of_callback_error(self) -> None:
+        class Response:
+            def __init__(self, fixture: str) -> None:
+                self.body = (FIXTURES / fixture).read_bytes()
+
+            def read(self, _size=None):
+                return self.body
+
+            def geturl(self):
+                return beca_logtime.LOGIN_URL
+
+        class RejectedClient(beca_logtime.BecaClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.responses = [Response("login-page.html"), Response("login-invalid-password.html")]
+
+            def _open(self, _request):
+                return self.responses.pop(0)
+
+        with self.assertRaises(beca_logtime.BecaError) as raised:
+            RejectedClient().login("demo", "wrong-password")
+        self.assertEqual(raised.exception.code, "AUTH_INVALID")
+        self.assertFalse(raised.exception.data_changed)
+
+    def test_login_mfa_returns_explicit_challenge_error(self) -> None:
+        class Response:
+            def __init__(self, fixture: str) -> None:
+                self.body = (FIXTURES / fixture).read_bytes()
+
+            def read(self, _size=None):
+                return self.body
+
+            def geturl(self):
+                return beca_logtime.LOGIN_URL
+
+        class MfaClient(beca_logtime.BecaClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.responses = [Response("login-page.html"), Response("login-mfa.html")]
+
+            def _open(self, _request):
+                return self.responses.pop(0)
+
+        with self.assertRaises(beca_logtime.BecaError) as raised:
+            MfaClient().login("demo", "password-demo")
+        self.assertEqual(raised.exception.code, "AUTH_CHALLENGE_REQUIRED")
+
+    def test_new_cli_commands_are_discoverable(self) -> None:
+        parser = beca_logtime.build_parser()
+        self.assertIs(parser.parse_args(["setup", "--no-store"]).func, beca_logtime.command_setup)
+        self.assertIs(parser.parse_args(["doctor", "--json"]).func, beca_logtime.command_doctor)
+        self.assertIs(parser.parse_args(["whoami"]).func, beca_logtime.command_whoami)
+        self.assertIs(parser.parse_args(["reset-auth"]).func, beca_logtime.command_reset_auth)
+        self.assertIs(parser.parse_args(["version"]).func, beca_logtime.command_version)
+
+    def test_setup_with_environment_credentials_is_read_only_and_writes_safe_config(self) -> None:
+        class SetupClient:
+            authenticated_user = None
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def login(self, username, password):
+                self.calls.append(("login", username, password))
+                self.authenticated_user = {
+                    "id": 100,
+                    "email": "demo@example.com",
+                    "fullName": "Demo User",
+                    "departmentId": 5,
+                }
+
+            def verify_login(self):
+                return self.authenticated_user
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = SetupClient()
+            environment = {
+                "BECA_USERNAME": "demo",
+                "BECA_PASSWORD": "password-demo",
+                "BECA_CONFIG_DIR": directory,
+            }
+            with patch.dict(beca_logtime.os.environ, environment, clear=False), patch.object(
+                beca_logtime, "inspect_logtime_contract", return_value={"compatible": True}
+            ), patch.object(beca_logtime, "list_tasks", return_value=[{"id": 1}]):
+                with redirect_stdout(io.StringIO()):
+                    result = beca_logtime.command_setup(
+                        client,
+                        Namespace(username=None, no_store=True, json=True),
+                    )
+            self.assertEqual(result, 0)
+            self.assertEqual(client.calls, [("login", "demo", "password-demo")])
+            saved = json.loads((pathlib.Path(directory) / "config.json").read_text())
+            self.assertEqual(saved["username"], "demo")
+            self.assertNotIn("password", json.dumps(saved).casefold())
+
+    def test_reset_auth_recovers_from_invalid_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "config.json"
+            target.write_text("not-json", encoding="utf-8")
+            with patch.dict(beca_logtime.os.environ, {"BECA_CONFIG_DIR": directory}, clear=False):
+                with redirect_stdout(io.StringIO()):
+                    result = beca_logtime.command_reset_auth(
+                        object(), Namespace(json=True)
+                    )
+            self.assertEqual(result, 0)
+            self.assertFalse(target.exists())
+
+    def test_doctor_is_read_only_and_reports_ready(self) -> None:
+        class Response:
+            def read(self, _size=None):
+                return b"<html>login</html>"
+
+        class DoctorClient:
+            auth_source = "environment"
+            authenticated_user = {
+                "id": 100,
+                "email": "demo@example.com",
+                "fullName": "Demo User",
+            }
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def _headers(self, headers=None, target_url=None):
+                return {"Accept": "application/json"}
+
+            def _open(self, request):
+                self.calls.append(("GET", request.full_url))
+                return Response()
+
+            def ensure_auth(self, interactive=False):
+                self.calls.append(("AUTH", interactive))
+
+            def verify_login(self):
+                return self.authenticated_user
+
+        client = DoctorClient()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            beca_logtime.os.environ, {"BECA_CONFIG_DIR": directory}, clear=False
+        ), patch.object(
+            beca_logtime, "load_config", return_value={"schemaVersion": 1, "username": "demo"}
+        ), patch.object(
+            beca_logtime, "keyring_backend_status", return_value={"available": True, "backend": "TestKeyring", "message": None}
+        ), patch.object(
+            beca_logtime, "inspect_logtime_contract", return_value={"compatible": True}
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = beca_logtime.command_doctor(
+                    client, Namespace(json=True, debug=True)
+                )
+        self.assertEqual(result, 0)
+        report = json.loads(output.getvalue())
+        self.assertTrue(report["ready"])
+        self.assertFalse(report["dataChanged"])
+        self.assertFalse(any(method in {"POST", "PUT", "PATCH", "DELETE"} for method, *_ in client.calls))
+
     def test_previous_business_day_skips_weekend(self) -> None:
         self.assertEqual(
             beca_logtime.previous_business_day(date(2026, 7, 6)),
@@ -203,6 +463,13 @@ class BecaLogtimeTests(unittest.TestCase):
         )
         self.assertIsNotNone(redirected)
         self.assertIsNone(redirected.get_header("Cookie"))
+
+    def test_explicit_cookie_is_only_attached_to_work_host(self) -> None:
+        client = beca_logtime.BecaClient(cookie="sid=secret")
+        work_headers = client._headers(target_url="https://work.becawork.vn/api/test")
+        sso_headers = client._headers(target_url="https://sso.becawork.vn/Account/Login")
+        self.assertEqual(work_headers.get("Cookie"), "sid=secret")
+        self.assertNotIn("Cookie", sso_headers)
 
     def test_prepare_blocks_negative_over_logtime_before_duplicate_check(self) -> None:
         client = FakeClient(over="-8", logs=[{"Ngay": "2026-07-01 00:00:00"}])

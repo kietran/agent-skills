@@ -27,6 +27,16 @@ Use `BECA_COOKIE` when supplied. Scope an explicitly supplied cookie to the Work
 - client id: `vwork.work`
 - redirect URI: `https://work.becawork.vn/signin-oidc`
 
+Parse SSO HTML as separate forms. Submit the actual login form action, and recognize a successful callback only when the form action targets the Work `/signin-oidc` endpoint and contains OIDC response fields such as `code`, `id_token`, `state`, or `session_state`. A returned password form is an authentication failure, not a callback. Detect OTP/CAPTCHA fields as an unsupported verification challenge and fail with a safe, actionable error.
+
+After submitting the callback, verify the session with:
+
+```text
+GET /api/Default/Work_GetInfLogin?IsMobile=false
+```
+
+Never include raw login/callback HTML or OIDC values in diagnostics.
+
 POST/PUT/PATCH/DELETE requests to `work.becawork.vn` must include `X-XSRF-TOKEN` from:
 
 ```text

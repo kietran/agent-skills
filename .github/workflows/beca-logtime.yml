@@ -1,0 +1,48 @@
+name: BecaWork Logtime
+
+on:
+  push:
+    paths:
+      - "skills/beca-logtime/**"
+      - ".github/workflows/beca-logtime.yml"
+  pull_request:
+    paths:
+      - "skills/beca-logtime/**"
+      - ".github/workflows/beca-logtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show environment
+        run: python -c "import platform, sys; print(platform.platform()); print(sys.version)"
+
+      - name: Run tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python skills/beca-logtime/scripts/test_beca_logtime.py
+
+      - name: Compile CLI
+        run: python -m py_compile skills/beca-logtime/scripts/beca_logtime.py
+
+      - name: Smoke-test public CLI
+        run: |
+          python skills/beca-logtime/scripts/beca_logtime.py version --json
+          python skills/beca-logtime/scripts/beca_logtime.py --help
