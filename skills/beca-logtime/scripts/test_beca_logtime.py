@@ -290,6 +290,8 @@ class BecaLogtimeTests(unittest.TestCase):
 
         client = SetupClient()
         with patch.dict(beca_logtime.os.environ, {"BECA_PASSWORD": "rejected-password"}), patch.object(
+            beca_logtime.sys.stdin, "isatty", return_value=True
+        ), patch.object(
             beca_logtime, "load_config", return_value={"username": "demo"}
         ), patch.object(
             beca_logtime, "ensure_keyring_available", return_value={"available": True}
