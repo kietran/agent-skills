@@ -10,10 +10,11 @@ Use the bundled CLI for BecaWork operations. Keep command details out of the con
 ## Mandatory authentication route
 
 - Always use `scripts/beca_logtime.py` for BecaWork authentication and operations. Do not use a browser, browser automation, or Computer Use as an alternative implementation of this skill.
-- When a normal BecaWork command returns `SETUP_REQUIRED` or `requiredAction: OPEN_INTERACTIVE_TERMINAL`, rerun that exact original command from the error hint in a PTY-backed terminal. Do not run standalone `setup`: the original command performs onboarding and then completes the user's request in the same Python process.
-- On Codex Desktop, start the command with the terminal execution tool using `tty: true`, take the returned `sessionId`, and call `open_in_codex` for a terminal with that exact `sessionId`. Never open a blank terminal or claim it is waiting for input without verifying the process is still attached.
-- Do not stop after reporting that login is missing, and do not ask the user to discover the setup command. Continue until setup exits successfully, the user cancels, or no interactive terminal capability exists.
-- Wait on the same terminal session until the command completes. Do not ask the user to send “xong” and then launch a second Python process.
+- When a normal BecaWork command returns `SETUP_REQUIRED` or `SETUP_REQUIRES_TTY`, authenticate before retrying the original request.
+- On Windows, run `scripts/beca_logtime.py login --window` with the resolved Python executable through the normal terminal execution tool. This opens one dedicated console and keeps the complete login session inside it: invalid credentials are reported there and the user can retry without returning to the Agent. The window returns control only after a successful login plus the user's close confirmation, an explicit `q` cancel, or the user closes the window. Wait on the parent process; do not poll between attempts. Do not use `tty: true` or `open_in_codex` for Windows login. After exit code 0, rerun the original BecaWork command in a new process; after cancellation, stop without checking the account.
+- On macOS and Linux, run `setup` in a PTY-backed terminal and expose that exact session to the user. If the app reports `status: queued`, keep the session alive and say that the panel is deferred; never claim it is visible or accept an unrelated blank shell.
+- Do not stop after reporting that login is missing, and do not ask the user to discover the setup command. Continue until setup exits successfully, the user cancels, or no supported interactive terminal capability exists.
+- Wait for the login process to complete, then continue the original read or preview request. Do not ask the user to send “xong”.
 - If the host cannot expose an interactive terminal, give the user the exact command returned by the CLI and ask them to run it. Do not silently switch to browser automation.
 - For `AUTH_CHALLENGE_REQUIRED`, explain that MFA/CAPTCHA is outside v2 support. Do not bypass the skill or continue the requested BecaWork operation through Computer Use.
 

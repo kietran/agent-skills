@@ -1,6 +1,6 @@
 interface:
   display_name: "BecaWork Logtime"
   short_description: "Set up and manage BecaWork logtime"
-  default_prompt: "Use $beca-logtime and its CLI for BecaWork; when authentication is required, rerun the original command in a visible PTY terminal and keep its session attached until completion."
+  default_prompt: "Use $beca-logtime and its CLI for BecaWork; on Windows authenticate with login --window, let the user retry or cancel entirely inside that window, wait for it to close, then retry the original read or preview request only after success."
 policy:
   allow_implicit_invocation: true

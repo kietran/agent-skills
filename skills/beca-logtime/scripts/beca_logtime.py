@@ -29,10 +29,13 @@ SSO_ORIGIN = "https://sso.becawork.vn"
 USER_AGENT = "Mozilla/5.0"
 LOCAL_TIMEZONE = timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
 MIN_PYTHON = (3, 11)
-CLI_VERSION = "2.1.0"
+CLI_VERSION = "2.4.0"
 CONFIG_SCHEMA_VERSION = 1
 KEYRING_SERVICE = "beca-logtime"
 KEYRING_REQUIREMENT = "keyring>=25,<26"
+LOGIN_WINDOW_ENV = "BECA_LOGTIME_LOGIN_WINDOW"
+LOGIN_CANCELLED_EXIT = 130
+LOGIN_RETRYABLE_CODES = frozenset({"AUTH_INVALID", "SETUP_INVALID", "NETWORK_ERROR"})
 LOGIN_URL = (
     "https://sso.becawork.vn/Account/Login?"
     "ReturnUrl=%2Fconnect%2Fauthorize%2Fcallback%3Fclient_id%3Dvwork.work"
@@ -462,6 +465,25 @@ def cli_command_text(command_arguments: list[str]) -> str:
 
 def setup_command_text() -> str:
     return cli_command_text(["setup"])
+
+
+def login_window_command(username: str | None = None) -> list[str]:
+    command = [sys.executable, "-X", "utf8", str(Path(__file__).resolve()), "login-session"]
+    if username:
+        command.extend(["--username", username])
+    return command
+
+
+def login_hint() -> str:
+    if sys.platform.startswith("win"):
+        return (
+            f"Mở cửa sổ đăng nhập an toàn bằng: {cli_command_text(['login', '--window'])}. "
+            "Không dùng browser hoặc Computer Use."
+        )
+    return (
+        f"Mở terminal tương tác và chạy: {setup_command_text()}. "
+        "Không dùng browser hoặc Computer Use."
+    )
 
 
 @dataclass
@@ -929,6 +951,16 @@ def parse_log_date(raw: str | None) -> date:
     if raw:
         return datetime.strptime(raw, "%Y-%m-%d").date()
     return previous_business_day()
+
+
+def parse_iso_date(raw: str, option_name: str) -> date:
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise BecaError(
+            f"{option_name} phải có định dạng YYYY-MM-DD.",
+            code="INVALID_ARGUMENT",
+        ) from exc
 
 
 def now_string() -> str:
@@ -1892,14 +1924,36 @@ def summarize_logtime_row(row: dict[str, Any]) -> dict[str, Any]:
 def list_logtimes(client: BecaClient, args: argparse.Namespace) -> list[dict[str, Any]]:
     log_date = parse_log_date(args.date)
     user = get_current_user(client)
-    department = first_text(args.department, user.get("departmentId"), user.get("department"))
+    return list_logtimes_for_date(
+        client,
+        log_date,
+        project_id=args.project_id,
+        department=args.department,
+        user=user,
+    )
+
+
+def list_logtimes_for_date(
+    client: BecaClient,
+    log_date: date,
+    *,
+    project_id: str = "-1",
+    department: str | None = None,
+    user: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    current_user = user or get_current_user(client)
+    department_id = first_text(
+        department,
+        current_user.get("departmentId"),
+        current_user.get("department"),
+    )
     data = response_data(client.get_json(
         "/api/Default/Work_TimeSheetPersonalLayoutList",
         {
             "date": log_date.isoformat(),
-            "projectId": args.project_id,
-            "email": normalize_user_id(user.get("id")),
-            "department": department,
+            "projectId": project_id,
+            "email": normalize_user_id(current_user.get("id")),
+            "department": department_id,
         },
     ))
     if not isinstance(data, list):
@@ -1912,6 +1966,51 @@ def list_logtimes(client: BecaClient, args: argparse.Namespace) -> list[dict[str
         if row.get("date") == target_date
         and (row["logId"] or row["logUserWorkflowId"] or row["workId"])
     ]
+
+
+def latest_logtime(client: BecaClient, args: argparse.Namespace) -> dict[str, Any]:
+    lookback_days = args.lookback_days
+    if lookback_days < 1 or lookback_days > 366:
+        raise BecaError(
+            "--lookback-days phải nằm trong khoảng 1..366.",
+            code="INVALID_ARGUMENT",
+        )
+    through = (
+        parse_iso_date(args.through, "--through")
+        if args.through
+        else datetime.now(LOCAL_TIMEZONE).date()
+    )
+    user = get_current_user(client)
+    checked_dates: list[str] = []
+    for offset in range(lookback_days):
+        candidate = through - timedelta(days=offset)
+        if not args.include_weekends and candidate.weekday() >= 5:
+            continue
+        checked_dates.append(candidate.isoformat())
+        rows = list_logtimes_for_date(
+            client,
+            candidate,
+            project_id=args.project_id,
+            department=args.department,
+            user=user,
+        )
+        if rows:
+            return {
+                "ok": True,
+                "found": True,
+                "date": candidate.isoformat(),
+                "rows": rows,
+                "datesChecked": len(checked_dates),
+                "lookbackDays": lookback_days,
+            }
+    return {
+        "ok": True,
+        "found": False,
+        "date": None,
+        "rows": [],
+        "datesChecked": len(checked_dates),
+        "lookbackDays": lookback_days,
+    }
 
 
 def values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2682,6 +2781,91 @@ def command_version(_client: BecaClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def command_login(client: BecaClient, args: argparse.Namespace) -> int:
+    if not args.window:
+        return command_setup(
+            client,
+            argparse.Namespace(username=args.username, json=False),
+        )
+    if not sys.platform.startswith("win"):
+        raise BecaError(
+            "Cửa sổ đăng nhập riêng hiện chỉ được hỗ trợ trên Windows.",
+            code="LOGIN_WINDOW_UNSUPPORTED",
+            hint=f"Mở terminal tương tác và chạy: {setup_command_text()}.",
+            exit_code=2,
+            required_action="OPEN_INTERACTIVE_TERMINAL",
+        )
+
+    environment = os.environ.copy()
+    environment[LOGIN_WINDOW_ENV] = "1"
+    environment["PYTHONUTF8"] = "1"
+    creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+    try:
+        completed = subprocess.run(
+            login_window_command(args.username),
+            env=environment,
+            creationflags=creation_flags,
+            check=False,
+        )
+    except OSError as exc:
+        raise BecaError(
+            "Không thể mở cửa sổ đăng nhập BecaWork.",
+            code="LOGIN_WINDOW_FAILED",
+            hint=f"Mở terminal tương tác và chạy: {setup_command_text()}.",
+            exit_code=2,
+            required_action="OPEN_INTERACTIVE_TERMINAL",
+        ) from exc
+    if completed.returncode == LOGIN_CANCELLED_EXIT:
+        print("Người dùng đã đóng phiên đăng nhập BecaWork.")
+        return LOGIN_CANCELLED_EXIT
+    if completed.returncode != 0:
+        raise BecaError(
+            "Đăng nhập BecaWork chưa hoàn tất.",
+            code="LOGIN_WINDOW_FAILED",
+            hint="Kiểm tra thông báo trong cửa sổ đăng nhập rồi thử lại.",
+            exit_code=completed.returncode,
+        )
+    print("Đăng nhập BecaWork đã hoàn tất trong cửa sổ an toàn.")
+    return 0
+
+
+def command_login_session(_client: BecaClient, args: argparse.Namespace) -> int:
+    username = args.username
+    while True:
+        try:
+            result = command_setup(
+                BecaClient(cookie=args.cookie),
+                argparse.Namespace(username=username, json=False, force_prompt=True),
+            )
+        except (EOFError, KeyboardInterrupt):
+            os.environ[LOGIN_WINDOW_ENV] = "handled"
+            print("\nĐã hủy phiên đăng nhập BecaWork.")
+            return LOGIN_CANCELLED_EXIT
+        except BecaError as exc:
+            if exc.code not in LOGIN_RETRYABLE_CODES:
+                raise
+            print(f"\nĐăng nhập chưa thành công [{exc.code}]: {exc}", file=sys.stderr)
+            if exc.hint:
+                print(f"Gợi ý: {exc.hint}", file=sys.stderr)
+            try:
+                choice = input("\nNhấn Enter để thử lại, hoặc nhập q để đóng cửa sổ: ").strip().casefold()
+            except (EOFError, KeyboardInterrupt):
+                choice = "q"
+            if choice in {"q", "quit", "exit"}:
+                os.environ[LOGIN_WINDOW_ENV] = "handled"
+                print("Đã hủy phiên đăng nhập BecaWork.")
+                return LOGIN_CANCELLED_EXIT
+            username = None
+            continue
+
+        try:
+            input("\nĐăng nhập thành công. Nhấn Enter để đóng cửa sổ và tiếp tục trong Codex...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        os.environ[LOGIN_WINDOW_ENV] = "handled"
+        return result
+
+
 def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
     if not runtime_supported():
         raise BecaError(
@@ -2696,7 +2880,8 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
             raise
         existing = {}
     keyring_status = ensure_keyring_available(announce=not args.json)
-    username = str(
+    force_prompt = bool(getattr(args, "force_prompt", False))
+    default_username = str(
         args.username
         or os.getenv("BECA_USERNAME")
         or existing.get("username")
@@ -2704,23 +2889,46 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
         or kwallet_lookup("username")
         or ""
     ).strip()
-    if not username:
+    username = default_username
+    if force_prompt:
+        prompt = f"BecaWork username [{default_username}]: " if default_username else "BecaWork username: "
+        try:
+            entered_username = input(prompt).strip()
+        except EOFError as exc:
+            raise BecaError(
+                "Terminal hiện tại không nhận được dữ liệu nhập tài khoản.",
+                code="SETUP_REQUIRES_TTY",
+                hint=login_hint(),
+                exit_code=2,
+                required_action="OPEN_INTERACTIVE_TERMINAL",
+            ) from exc
+        username = entered_username or default_username
+    elif not username:
         if not sys.stdin.isatty():
             raise BecaError(
                 "Setup cần terminal tương tác để nhập tài khoản.",
                 code="SETUP_REQUIRES_TTY",
-                hint=f"Mở terminal tương tác và chạy: {setup_command_text()}. Không dùng browser hoặc Computer Use.",
+                hint=login_hint(),
                 exit_code=2,
                 required_action="OPEN_INTERACTIVE_TERMINAL",
             )
-        username = input("BecaWork username: ").strip()
+        try:
+            username = input("BecaWork username: ").strip()
+        except EOFError as exc:
+            raise BecaError(
+                "Terminal hiện tại không nhận được dữ liệu nhập tài khoản.",
+                code="SETUP_REQUIRES_TTY",
+                hint=login_hint(),
+                exit_code=2,
+                required_action="OPEN_INTERACTIVE_TERMINAL",
+            ) from exc
     if not username:
         raise BecaError("Username không được để trống.", code="SETUP_INVALID")
 
-    password = os.getenv("BECA_PASSWORD")
-    if not password:
+    password = None if force_prompt else os.getenv("BECA_PASSWORD")
+    if not password and not force_prompt:
         password = keyring_lookup(username)
-    if not password:
+    if not password and not force_prompt:
         password = secret_tool_lookup(
             {"service": "becawork", "kind": "password", "username": username}
         ) or kwallet_lookup("password")
@@ -2729,11 +2937,20 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
             raise BecaError(
                 "Setup cần terminal tương tác để nhập mật khẩu an toàn.",
                 code="SETUP_REQUIRES_TTY",
-                hint=f"Mở terminal tương tác và chạy: {setup_command_text()}. Không dùng browser hoặc Computer Use.",
+                hint=login_hint(),
                 exit_code=2,
                 required_action="OPEN_INTERACTIVE_TERMINAL",
             )
-        password = getpass.getpass("BecaWork password: ")
+        try:
+            password = getpass.getpass("BecaWork password: ")
+        except EOFError as exc:
+            raise BecaError(
+                "Terminal hiện tại không nhận được mật khẩu an toàn.",
+                code="SETUP_REQUIRES_TTY",
+                hint=login_hint(),
+                exit_code=2,
+                required_action="OPEN_INTERACTIVE_TERMINAL",
+            ) from exc
     if not password:
         raise BecaError("Password không được để trống.", code="SETUP_INVALID")
 
@@ -2921,6 +3138,22 @@ def command_list_tasks(client: BecaClient, args: argparse.Namespace) -> int:
 def command_list_logtimes(client: BecaClient, args: argparse.Namespace) -> int:
     rows = list_logtimes(client, args)
     print_logtimes(rows, args.json)
+    return 0
+
+
+def command_latest_logtime(client: BecaClient, args: argparse.Namespace) -> int:
+    result = latest_logtime(client, args)
+    if args.json:
+        print_json(result)
+    elif result["found"]:
+        print(f"Logtime gần nhất: {result['date']}")
+        print_logtimes(result["rows"], False)
+    else:
+        print(
+            "Không tìm thấy logtime trong "
+            f"{result['lookbackDays']} ngày gần nhất "
+            f"({result['datesChecked']} ngày đã kiểm tra)."
+        )
     return 0
 
 
@@ -3233,6 +3466,18 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--json", action="store_true")
     setup_parser.set_defaults(func=command_setup)
 
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Authenticate BecaWork; --window opens a dedicated secure console on Windows",
+    )
+    login_parser.add_argument("--username", help="BecaWork username; password is always read securely")
+    login_parser.add_argument("--window", action="store_true", help="Open a dedicated Windows console")
+    login_parser.set_defaults(func=command_login)
+
+    login_session_parser = subparsers.add_parser("login-session", help=argparse.SUPPRESS)
+    login_session_parser.add_argument("--username")
+    login_session_parser.set_defaults(func=command_login_session)
+
     doctor_parser = subparsers.add_parser("doctor", help="Diagnose runtime, network, login, and API compatibility")
     doctor_parser.add_argument("--json", action="store_true")
     doctor_parser.add_argument("--debug", action="store_true", help="Include redacted diagnostic metadata")
@@ -3273,6 +3518,33 @@ def build_parser() -> argparse.ArgumentParser:
     logtimes_parser.add_argument("--department", help="Department id; defaults to current user's department")
     logtimes_parser.add_argument("--json", action="store_true")
     logtimes_parser.set_defaults(func=command_list_logtimes)
+
+    latest_logtime_parser = subparsers.add_parser(
+        "latest-logtime",
+        help="Find the most recent personal logtime in one CLI invocation",
+    )
+    latest_logtime_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=90,
+        help="Calendar-day search window, 1..366 (default: 90)",
+    )
+    latest_logtime_parser.add_argument(
+        "--through",
+        help="Latest date to include as YYYY-MM-DD; defaults to today",
+    )
+    latest_logtime_parser.add_argument("--project-id", default="-1")
+    latest_logtime_parser.add_argument(
+        "--department",
+        help="Department id; defaults to current user's department",
+    )
+    latest_logtime_parser.add_argument(
+        "--include-weekends",
+        action="store_true",
+        help="Also query Saturday and Sunday",
+    )
+    latest_logtime_parser.add_argument("--json", action="store_true")
+    latest_logtime_parser.set_defaults(func=command_latest_logtime)
 
     comments_parser = subparsers.add_parser(
         "list-comments",
@@ -3380,7 +3652,7 @@ def main(argv: list[str] | None = None) -> int:
             hint="Cài Python 3.11+ rồi thử lại.",
         )
     client = BecaClient(cookie=args.cookie)
-    if args.command not in {"setup", "doctor", "reset-auth", "version"}:
+    if args.command not in {"setup", "login", "login-session", "doctor", "reset-auth", "version"}:
         try:
             client.ensure_auth(interactive=False)
         except BecaError as exc:
@@ -3390,7 +3662,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise BecaError(
                     "BecaWork cần đăng nhập trong terminal tương tác trước khi tiếp tục yêu cầu này.",
                     code="SETUP_REQUIRED",
-                    hint=f"Chạy chính yêu cầu hiện tại trong terminal tương tác: {cli_command_text(command_arguments)}. Không chạy setup riêng và không dùng browser hoặc Computer Use.",
+                    hint=login_hint(),
                     exit_code=2,
                     required_action="OPEN_INTERACTIVE_TERMINAL",
                 ) from exc
@@ -3402,9 +3674,25 @@ def main(argv: list[str] | None = None) -> int:
     return args.func(client, args)
 
 
-if __name__ == "__main__":
+def configure_text_stream(stream: Any) -> None:
+    reconfigure = getattr(stream, "reconfigure", None)
+    if not callable(reconfigure):
+        return
     try:
-        raise SystemExit(main())
+        reconfigure(encoding="utf-8", errors="replace")
+    except (LookupError, OSError):
+        pass
+
+
+def configure_output_encoding() -> None:
+    configure_text_stream(sys.stdout)
+    configure_text_stream(sys.stderr)
+
+
+def run_cli() -> int:
+    configure_output_encoding()
+    try:
+        return main()
     except BecaError as exc:
         if "--json" in sys.argv:
             print(json.dumps(exc.as_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
@@ -3415,4 +3703,19 @@ if __name__ == "__main__":
             if exc.required_action:
                 print(f"required action: {exc.required_action}", file=sys.stderr)
             print(f"data changed: {'yes' if exc.data_changed else 'no'}", file=sys.stderr)
-        raise SystemExit(exc.exit_code)
+        return exc.exit_code
+
+
+def pause_login_window() -> None:
+    if os.getenv(LOGIN_WINDOW_ENV) != "1" or not sys.stdin.isatty():
+        return
+    try:
+        input("\nNhấn Enter để đóng cửa sổ đăng nhập...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+if __name__ == "__main__":
+    exit_code = run_cli()
+    pause_login_window()
+    raise SystemExit(exit_code)

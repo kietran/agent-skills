@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from argparse import Namespace
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from unittest.mock import patch
 
@@ -82,6 +82,41 @@ class BecaLogtimeTests(unittest.TestCase):
             command = beca_logtime.setup_command_text()
         self.assertIn('"C:\\Program Files\\Python311\\python.exe"', command)
         self.assertTrue(command.endswith("setup"))
+
+    def test_login_session_retries_invalid_credentials_before_success(self) -> None:
+        invalid = beca_logtime.BecaError("Sai tài khoản hoặc mật khẩu", code="AUTH_INVALID")
+        with patch.dict(beca_logtime.os.environ, {beca_logtime.LOGIN_WINDOW_ENV: "1"}), patch.object(
+            beca_logtime, "BecaClient"
+        ), patch.object(
+            beca_logtime, "command_setup", side_effect=[invalid, 0]
+        ) as setup, patch(
+            "builtins.input", side_effect=["", ""]
+        ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = beca_logtime.command_login_session(
+                object(), Namespace(username="demo", cookie=None)
+            )
+            window_state = beca_logtime.os.environ[beca_logtime.LOGIN_WINDOW_ENV]
+        self.assertEqual(result, 0)
+        self.assertEqual(setup.call_count, 2)
+        self.assertEqual(setup.call_args_list[0].args[1].username, "demo")
+        self.assertIsNone(setup.call_args_list[1].args[1].username)
+        self.assertEqual(window_state, "handled")
+
+    def test_login_session_can_be_cancelled_after_invalid_credentials(self) -> None:
+        invalid = beca_logtime.BecaError("Sai tài khoản hoặc mật khẩu", code="AUTH_INVALID")
+        with patch.dict(beca_logtime.os.environ, {beca_logtime.LOGIN_WINDOW_ENV: "1"}), patch.object(
+            beca_logtime, "BecaClient"
+        ), patch.object(
+            beca_logtime, "command_setup", side_effect=invalid
+        ), patch(
+            "builtins.input", return_value="q"
+        ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = beca_logtime.command_login_session(
+                object(), Namespace(username=None, cookie=None)
+            )
+            window_state = beca_logtime.os.environ[beca_logtime.LOGIN_WINDOW_ENV]
+        self.assertEqual(result, beca_logtime.LOGIN_CANCELLED_EXIT)
+        self.assertEqual(window_state, "handled")
 
     def test_form_parser_scopes_inputs_to_each_form(self) -> None:
         forms = beca_logtime.parse_forms(
@@ -197,10 +232,86 @@ class BecaLogtimeTests(unittest.TestCase):
     def test_new_cli_commands_are_discoverable(self) -> None:
         parser = beca_logtime.build_parser()
         self.assertIs(parser.parse_args(["setup"]).func, beca_logtime.command_setup)
+        self.assertIs(parser.parse_args(["login", "--window"]).func, beca_logtime.command_login)
         self.assertIs(parser.parse_args(["doctor", "--json"]).func, beca_logtime.command_doctor)
         self.assertIs(parser.parse_args(["whoami"]).func, beca_logtime.command_whoami)
         self.assertIs(parser.parse_args(["reset-auth"]).func, beca_logtime.command_reset_auth)
         self.assertIs(parser.parse_args(["version"]).func, beca_logtime.command_version)
+        self.assertIs(
+            parser.parse_args(["latest-logtime"]).func,
+            beca_logtime.command_latest_logtime,
+        )
+
+    def test_windows_login_opens_dedicated_console_and_waits(self) -> None:
+        completed = type("Completed", (), {"returncode": 0})()
+        args = Namespace(window=True, username="demo", cookie=None)
+        with patch.object(beca_logtime.sys, "platform", "win32"), patch.object(
+            beca_logtime.subprocess, "run", return_value=completed
+        ) as run, redirect_stdout(io.StringIO()):
+            result = beca_logtime.command_login(object(), args)
+        self.assertEqual(result, 0)
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], [beca_logtime.sys.executable, "-X", "utf8"])
+        self.assertEqual(command[-3:], ["login-session", "--username", "demo"])
+        self.assertEqual(run.call_args.kwargs["env"][beca_logtime.LOGIN_WINDOW_ENV], "1")
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONUTF8"], "1")
+        self.assertNotEqual(run.call_args.kwargs["creationflags"], 0)
+
+    def test_setup_eof_routes_to_login_window_on_windows(self) -> None:
+        with patch.object(beca_logtime.sys, "platform", "win32"), patch.object(
+            beca_logtime, "load_config", return_value={}
+        ), patch.object(
+            beca_logtime, "ensure_keyring_available", return_value={"available": True}
+        ), patch.object(
+            beca_logtime.sys.stdin, "isatty", return_value=True
+        ), patch("builtins.input", side_effect=EOFError):
+            with self.assertRaises(beca_logtime.BecaError) as raised:
+                beca_logtime.command_setup(object(), Namespace(username=None, json=False))
+        self.assertEqual(raised.exception.code, "SETUP_REQUIRES_TTY")
+        self.assertIn("login", raised.exception.hint)
+        self.assertIn("--window", raised.exception.hint)
+
+    def test_login_session_forces_fresh_password_instead_of_reusing_saved_secret(self) -> None:
+        class SetupClient:
+            authenticated_user = {
+                "id": 100,
+                "email": "demo@example.com",
+                "fullName": "Demo User",
+            }
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def login(self, username, password):
+                self.calls.append((username, password))
+
+            def verify_login(self):
+                return self.authenticated_user
+
+        client = SetupClient()
+        with patch.dict(beca_logtime.os.environ, {"BECA_PASSWORD": "rejected-password"}), patch.object(
+            beca_logtime, "load_config", return_value={"username": "demo"}
+        ), patch.object(
+            beca_logtime, "ensure_keyring_available", return_value={"available": True}
+        ), patch(
+            "builtins.input", return_value=""
+        ), patch.object(
+            beca_logtime.getpass, "getpass", return_value="fresh-password"
+        ), patch.object(
+            beca_logtime, "inspect_logtime_contract", return_value={"compatible": True}
+        ), patch.object(
+            beca_logtime, "list_tasks", return_value=[]
+        ), patch.object(
+            beca_logtime, "keyring_store"
+        ) as store, patch.object(
+            beca_logtime, "save_config", return_value=pathlib.Path("config.json")
+        ), redirect_stdout(io.StringIO()):
+            result = beca_logtime.command_setup(
+                client, Namespace(username=None, json=False, force_prompt=True)
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(client.calls, [("demo", "fresh-password")])
+        store.assert_called_once_with("demo", "fresh-password")
 
     def test_setup_with_environment_credentials_is_read_only_and_writes_safe_config(self) -> None:
         class SetupClient:
@@ -270,7 +381,7 @@ class BecaLogtimeTests(unittest.TestCase):
         self.assertIn(beca_logtime.KEYRING_REQUIREMENT, command)
         self.assertTrue(result["installed"])
 
-    def test_non_tty_main_requests_original_command_not_standalone_setup(self) -> None:
+    def test_non_tty_main_requests_windows_login_window(self) -> None:
         class MissingAuthClient:
             def __init__(self, cookie=None) -> None:
                 pass
@@ -284,8 +395,8 @@ class BecaLogtimeTests(unittest.TestCase):
             with self.assertRaises(beca_logtime.BecaError) as raised:
                 beca_logtime.main(["whoami"])
         self.assertEqual(raised.exception.required_action, "OPEN_INTERACTIVE_TERMINAL")
-        self.assertIn("whoami", raised.exception.hint)
-        self.assertIn("Không chạy setup riêng", raised.exception.hint)
+        self.assertIn("login", raised.exception.hint)
+        self.assertIn("--window", raised.exception.hint)
 
     def test_interactive_main_runs_setup_and_original_command_in_same_process(self) -> None:
         class InteractiveClient:
@@ -399,6 +510,15 @@ class BecaLogtimeTests(unittest.TestCase):
             beca_logtime.previous_business_day(date(2026, 7, 1)),
             date(2026, 6, 30),
         )
+
+    def test_output_stream_is_reconfigured_to_utf8(self) -> None:
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="cp1252")
+        beca_logtime.configure_text_stream(stream)
+        self.assertEqual(stream.encoding.casefold(), "utf-8")
+        stream.write("Đăng nhập thành công")
+        stream.flush()
+        self.assertIn("Đăng nhập".encode("utf-8"), raw.getvalue())
 
     def test_html_description_wraps_plain_text_only(self) -> None:
         self.assertEqual(beca_logtime.html_description("Fix API"), "<p>Fix API</p>")
@@ -876,6 +996,59 @@ class BecaLogtimeTests(unittest.TestCase):
             Namespace(date="2026-07-01", department=None, project_id="-1"),
         )
         self.assertEqual([row["logId"] for row in rows], ["1"])
+
+    def test_latest_logtime_stops_at_first_workday_with_rows(self) -> None:
+        client = FakeClient(
+            over=0,
+            logs=[],
+            timesheet_rows=[
+                log_row_from_values(
+                    {"Ngay": "2026-07-03", "SoGio": 8, "Congviec": "1", "Duan": "p"},
+                    1,
+                    11,
+                )
+            ],
+        )
+        result = beca_logtime.latest_logtime(
+            client,
+            Namespace(
+                lookback_days=7,
+                through="2026-07-06",
+                include_weekends=False,
+                department=None,
+                project_id="-1",
+            ),
+        )
+        self.assertTrue(result["found"])
+        self.assertEqual(result["date"], "2026-07-03")
+        self.assertEqual(result["datesChecked"], 2)
+        timesheet_requests = [
+            request
+            for request in client.requests
+            if request["path"] == "/api/Default/Work_TimeSheetPersonalLayoutList"
+        ]
+        self.assertEqual(
+            [request["params"]["date"] for request in timesheet_requests],
+            ["2026-07-06", "2026-07-03"],
+        )
+        self.assertEqual(
+            client.calls.count("GET:/api/Default/Work_GetInfLogin"),
+            1,
+        )
+
+    def test_latest_logtime_validates_lookback_range(self) -> None:
+        with self.assertRaises(beca_logtime.BecaError) as raised:
+            beca_logtime.latest_logtime(
+                FakeClient(over=0, logs=[]),
+                Namespace(
+                    lookback_days=0,
+                    through="2026-07-06",
+                    include_weekends=False,
+                    department=None,
+                    project_id="-1",
+                ),
+            )
+        self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
 
     def test_comment_redaction_is_default_and_can_be_disabled(self) -> None:
         secret = "tài khoản test: demo / Secret123 password: Hidden456"
