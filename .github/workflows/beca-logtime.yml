@@ -42,6 +42,11 @@ jobs:
       - name: Compile CLI
         run: python -m py_compile skills/beca-logtime/scripts/beca_logtime.py
 
+      - name: Smoke-test managed keyring dependency
+        run: |
+          python -m pip install --disable-pip-version-check --target .keyring-smoke "keyring>=25,<26"
+          python -c "import sys; sys.path.insert(0, '.keyring-smoke'); import keyring; print(keyring.__version__ if hasattr(keyring, '__version__') else keyring.__name__)"
+
       - name: Smoke-test public CLI
         run: |
           python skills/beca-logtime/scripts/beca_logtime.py version --json

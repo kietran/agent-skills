@@ -196,7 +196,7 @@ class BecaLogtimeTests(unittest.TestCase):
 
     def test_new_cli_commands_are_discoverable(self) -> None:
         parser = beca_logtime.build_parser()
-        self.assertIs(parser.parse_args(["setup", "--no-store"]).func, beca_logtime.command_setup)
+        self.assertIs(parser.parse_args(["setup"]).func, beca_logtime.command_setup)
         self.assertIs(parser.parse_args(["doctor", "--json"]).func, beca_logtime.command_doctor)
         self.assertIs(parser.parse_args(["whoami"]).func, beca_logtime.command_whoami)
         self.assertIs(parser.parse_args(["reset-auth"]).func, beca_logtime.command_reset_auth)
@@ -230,17 +230,103 @@ class BecaLogtimeTests(unittest.TestCase):
             }
             with patch.dict(beca_logtime.os.environ, environment, clear=False), patch.object(
                 beca_logtime, "inspect_logtime_contract", return_value={"compatible": True}
-            ), patch.object(beca_logtime, "list_tasks", return_value=[{"id": 1}]):
-                with redirect_stdout(io.StringIO()):
+            ), patch.object(beca_logtime, "list_tasks", return_value=[{"id": 1}]), patch.object(
+                beca_logtime,
+                "ensure_keyring_available",
+                return_value={"available": True, "backend": "TestKeyring", "installed": False},
+            ), patch.object(beca_logtime, "keyring_store") as store:
+                output = io.StringIO()
+                with redirect_stdout(output):
                     result = beca_logtime.command_setup(
                         client,
-                        Namespace(username=None, no_store=True, json=True),
+                        Namespace(username=None, json=True),
                     )
             self.assertEqual(result, 0)
             self.assertEqual(client.calls, [("login", "demo", "password-demo")])
+            store.assert_called_once_with("demo", "password-demo")
             saved = json.loads((pathlib.Path(directory) / "config.json").read_text())
             self.assertEqual(saved["username"], "demo")
+            self.assertEqual(saved["credentialBackend"], "keyring")
             self.assertNotIn("password", json.dumps(saved).casefold())
+            setup_result = json.loads(output.getvalue())
+            self.assertEqual(setup_result["credentialBackend"], "keyring")
+            self.assertNotIn("session", output.getvalue().casefold())
+
+    def test_keyring_is_installed_into_managed_dependency_directory(self) -> None:
+        completed = type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        unavailable = {"available": False, "backend": None, "message": "missing"}
+        available = {"available": True, "backend": "Windows.Keyring", "message": None}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            beca_logtime.os.environ, {"BECA_CONFIG_DIR": directory}, clear=False
+        ), patch.object(
+            beca_logtime, "keyring_module", return_value=None
+        ), patch.object(
+            beca_logtime, "keyring_backend_status", side_effect=[unavailable, available]
+        ), patch.object(beca_logtime.subprocess, "run", return_value=completed) as run:
+            result = beca_logtime.ensure_keyring_available(announce=False)
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], [beca_logtime.sys.executable, "-m", "pip", "install"])
+        self.assertIn("--target", command)
+        self.assertIn(beca_logtime.KEYRING_REQUIREMENT, command)
+        self.assertTrue(result["installed"])
+
+    def test_non_tty_main_requests_original_command_not_standalone_setup(self) -> None:
+        class MissingAuthClient:
+            def __init__(self, cookie=None) -> None:
+                pass
+
+            def ensure_auth(self, interactive=False):
+                raise beca_logtime.BecaError("missing", code="SETUP_REQUIRED")
+
+        with patch.object(beca_logtime, "BecaClient", MissingAuthClient), patch.object(
+            beca_logtime.sys.stdin, "isatty", return_value=False
+        ):
+            with self.assertRaises(beca_logtime.BecaError) as raised:
+                beca_logtime.main(["whoami"])
+        self.assertEqual(raised.exception.required_action, "OPEN_INTERACTIVE_TERMINAL")
+        self.assertIn("whoami", raised.exception.hint)
+        self.assertIn("Không chạy setup riêng", raised.exception.hint)
+
+    def test_interactive_main_runs_setup_and_original_command_in_same_process(self) -> None:
+        class InteractiveClient:
+            authenticated_user = None
+
+            def __init__(self, cookie=None) -> None:
+                pass
+
+            def ensure_auth(self, interactive=False):
+                raise beca_logtime.BecaError("missing", code="SETUP_REQUIRED")
+
+            def verify_login(self):
+                return self.authenticated_user
+
+        def complete_setup(client, _args):
+            client.authenticated_user = {
+                "id": 100,
+                "email": "demo@example.com",
+                "fullName": "Demo User",
+            }
+            return 0
+
+        with patch.object(beca_logtime, "BecaClient", InteractiveClient), patch.object(
+            beca_logtime.sys.stdin, "isatty", return_value=True
+        ), patch.object(beca_logtime, "command_setup", side_effect=complete_setup) as setup:
+            with redirect_stdout(io.StringIO()):
+                result = beca_logtime.main(["whoami"])
+        self.assertEqual(result, 0)
+        setup.assert_called_once()
+
+    def test_keyring_install_failure_does_not_fall_back_to_session_only(self) -> None:
+        completed = type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "failure"})()
+        unavailable = {"available": False, "backend": None, "message": "missing"}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            beca_logtime.os.environ, {"BECA_CONFIG_DIR": directory}, clear=False
+        ), patch.object(beca_logtime, "keyring_module", return_value=None), patch.object(
+            beca_logtime, "keyring_backend_status", return_value=unavailable
+        ), patch.object(beca_logtime.subprocess, "run", return_value=completed):
+            with self.assertRaises(beca_logtime.BecaError) as raised:
+                beca_logtime.ensure_keyring_available(announce=False)
+        self.assertEqual(raised.exception.code, "KEYRING_INSTALL_FAILED")
 
     def test_reset_auth_recovers_from_invalid_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

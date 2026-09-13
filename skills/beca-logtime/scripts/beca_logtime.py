@@ -5,6 +5,7 @@ import argparse
 import difflib
 import getpass
 import html.parser
+import importlib
 import json
 import os
 import platform
@@ -28,9 +29,10 @@ SSO_ORIGIN = "https://sso.becawork.vn"
 USER_AGENT = "Mozilla/5.0"
 LOCAL_TIMEZONE = timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
 MIN_PYTHON = (3, 11)
-CLI_VERSION = "2.0.1"
+CLI_VERSION = "2.1.0"
 CONFIG_SCHEMA_VERSION = 1
 KEYRING_SERVICE = "beca-logtime"
+KEYRING_REQUIREMENT = "keyring>=25,<26"
 LOGIN_URL = (
     "https://sso.becawork.vn/Account/Login?"
     "ReturnUrl=%2Fconnect%2Fauthorize%2Fcallback%3Fclient_id%3Dvwork.work"
@@ -251,6 +253,10 @@ def config_file(**kwargs: Any) -> Path:
     return config_dir(**kwargs) / "config.json"
 
 
+def dependency_dir(**kwargs: Any) -> Path:
+    return config_dir(**kwargs) / "python-packages"
+
+
 def load_config(path: Path | None = None) -> dict[str, Any]:
     target = path or config_file()
     if not target.exists():
@@ -296,11 +302,80 @@ def save_config(value: dict[str, Any], path: Path | None = None) -> Path:
 
 
 def keyring_module():
+    vendor = str(dependency_dir())
+    if Path(vendor).exists() and vendor not in sys.path:
+        sys.path.insert(0, vendor)
     try:
         import keyring  # type: ignore[import-not-found]
     except ImportError:
         return None
     return keyring
+
+
+def install_keyring_dependency() -> dict[str, Any]:
+    target = dependency_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--target",
+        str(target),
+        KEYRING_REQUIREMENT,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BecaError(
+            "Không thể cài thành phần lưu đăng nhập an toàn.",
+            code="KEYRING_INSTALL_FAILED",
+            hint="Kiểm tra Internet và khả năng chạy pip của Python rồi chạy lại.",
+        ) from exc
+    if result.returncode != 0:
+        raise BecaError(
+            "Không thể cài thành phần lưu đăng nhập an toàn.",
+            code="KEYRING_INSTALL_FAILED",
+            hint="Kiểm tra Internet và khả năng chạy pip của Python rồi chạy lại.",
+        )
+    vendor = str(target)
+    if vendor not in sys.path:
+        sys.path.insert(0, vendor)
+    importlib.invalidate_caches()
+    status = keyring_backend_status()
+    if not status["available"]:
+        raise BecaError(
+            "Đã cài keyring nhưng hệ điều hành không cung cấp credential store khả dụng.",
+            code="KEYRING_UNAVAILABLE",
+            hint="Kiểm tra Windows Credential Manager, macOS Keychain hoặc Linux Secret Service rồi chạy lại.",
+        )
+    return {**status, "installed": True, "installPath": str(target)}
+
+
+def ensure_keyring_available(announce: bool = True) -> dict[str, Any]:
+    module = keyring_module()
+    status = keyring_backend_status()
+    if status["available"]:
+        return {**status, "installed": False, "installPath": None}
+    if module is not None:
+        raise BecaError(
+            "Python keyring đã có nhưng credential store của hệ điều hành không khả dụng.",
+            code="KEYRING_UNAVAILABLE",
+            hint="Kiểm tra Windows Credential Manager, macOS Keychain hoặc Linux Secret Service rồi chạy lại.",
+        )
+    if announce:
+        print("Đang cài thành phần lưu đăng nhập an toàn...")
+    installed = install_keyring_dependency()
+    if announce:
+        print("Đã chuẩn bị xong credential store.")
+    return installed
 
 
 def keyring_backend_status() -> dict[str, Any]:
@@ -345,7 +420,7 @@ def keyring_store(username: str, password: str) -> None:
         raise BecaError(
             "Không có credential store an toàn để lưu mật khẩu.",
             code="KEYRING_UNAVAILABLE",
-            hint="Cài package keyring hoặc tiếp tục với --no-store.",
+            hint="Chạy lại setup để tự cài và cấu hình keyring.",
         )
     try:
         keyring.set_password(KEYRING_SERVICE, username, password)
@@ -353,7 +428,7 @@ def keyring_store(username: str, password: str) -> None:
         raise BecaError(
             "Không thể lưu mật khẩu vào credential store của hệ điều hành.",
             code="KEYRING_WRITE_FAILED",
-            hint="Cho phép truy cập keychain/credential manager hoặc dùng --no-store.",
+            hint="Cho phép truy cập keychain/credential manager rồi chạy lại setup.",
         ) from exc
 
 
@@ -378,11 +453,15 @@ def setup_config(username: str, backend: str) -> dict[str, Any]:
     }
 
 
-def setup_command_text() -> str:
-    arguments = [sys.executable, str(Path(__file__).resolve()), "setup"]
+def cli_command_text(command_arguments: list[str]) -> str:
+    arguments = [sys.executable, str(Path(__file__).resolve()), *command_arguments]
     if sys.platform.startswith("win"):
         return subprocess.list2cmdline(arguments)
     return shlex.join(arguments)
+
+
+def setup_command_text() -> str:
+    return cli_command_text(["setup"])
 
 
 @dataclass
@@ -2616,6 +2695,7 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
         if exc.code != "CONFIG_INVALID":
             raise
         existing = {}
+    keyring_status = ensure_keyring_available(announce=not args.json)
     username = str(
         args.username
         or os.getenv("BECA_USERNAME")
@@ -2638,16 +2718,12 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
         raise BecaError("Username không được để trống.", code="SETUP_INVALID")
 
     password = os.getenv("BECA_PASSWORD")
-    source = "environment" if password else None
     if not password:
         password = keyring_lookup(username)
-        source = "keyring" if password else None
     if not password:
         password = secret_tool_lookup(
             {"service": "becawork", "kind": "password", "username": username}
         ) or kwallet_lookup("password")
-        source = "legacy-linux" if password else None
-    entered_password = False
     if not password:
         if not sys.stdin.isatty():
             raise BecaError(
@@ -2658,8 +2734,6 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
                 required_action="OPEN_INTERACTIVE_TERMINAL",
             )
         password = getpass.getpass("BecaWork password: ")
-        entered_password = True
-        source = "interactive"
     if not password:
         raise BecaError("Password không được để trống.", code="SETUP_INVALID")
 
@@ -2667,28 +2741,18 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
     user = client.authenticated_user or client.verify_login()
     contract = inspect_logtime_contract(client)
     tasks = list_tasks(client, active_task_args())
-
-    credential_backend = "session" if entered_password else (source or "session")
-    keyring_status = keyring_backend_status()
-    keyring_result = dict(keyring_status)
-    if entered_password and not args.no_store and keyring_status["available"]:
-        remember = True
-        if sys.stdin.isatty():
-            answer = input("Lưu mật khẩu an toàn trong credential store? [Y/n]: ").strip().lower()
-            remember = answer not in {"n", "no"}
-        if remember:
-            keyring_store(username, password)
-            credential_backend = "keyring"
-            keyring_result = {**keyring_status, "stored": True}
-    elif entered_password and not args.no_store and not keyring_status["available"]:
-        keyring_result = {**keyring_status, "stored": False}
-
-    config_target = save_config(setup_config(username, credential_backend))
+    keyring_store(username, password)
+    keyring_result = {**keyring_status, "stored": True}
+    try:
+        config_target = save_config(setup_config(username, "keyring"))
+    except BecaError:
+        keyring_delete(username)
+        raise
     result = {
         "ok": bool(contract.get("compatible")),
         "version": CLI_VERSION,
         "configPath": str(config_target),
-        "credentialBackend": credential_backend,
+        "credentialBackend": "keyring",
         "keyring": keyring_result,
         "user": user_identity(user),
         "activeTaskCount": len(tasks),
@@ -2704,10 +2768,7 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
         print(f"- Login: OK ({result['user'].get('fullName') or result['user'].get('email') or username})")
         print(f"- Active tasks: {len(tasks)}")
         print(f"- API contract: {'OK' if result['contractCompatible'] else 'INCOMPATIBLE'}")
-        if entered_password and not args.no_store and not keyring_status["available"]:
-            print("- Credential: session only (install optional package 'keyring' to remember securely)")
-        else:
-            print(f"- Credential: {credential_backend}")
+        print("- Credential: saved securely in the operating-system credential store")
         print("Setup hoàn tất. Chưa có dữ liệu BecaWork nào được thay đổi.")
     return 0 if result["ok"] else 2
 
@@ -2741,7 +2802,7 @@ def command_doctor(client: BecaClient, args: argparse.Namespace) -> int:
         "keyring",
         "ok" if keyring_info["available"] else "warning",
         keyring_info.get("message") or str(keyring_info.get("backend")),
-        None if keyring_info["available"] else "Có thể cài package tùy chọn 'keyring'.",
+        None if keyring_info["available"] else "Chạy setup để tự cài và cấu hình keyring.",
     )
     try:
         response = client._open(
@@ -3169,7 +3230,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_parser = subparsers.add_parser("setup", help="Set up BecaWork safely on this computer")
     setup_parser.add_argument("--username", help="BecaWork username; password is always read securely")
-    setup_parser.add_argument("--no-store", action="store_true", help="Do not store password in the OS credential store")
     setup_parser.add_argument("--json", action="store_true")
     setup_parser.set_defaults(func=command_setup)
 
@@ -3311,7 +3371,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    command_arguments = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(command_arguments)
     if not runtime_supported() and args.command not in {"doctor", "version"}:
         raise BecaError(
             f"BecaWork Logtime cần Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} trở lên.",
@@ -3323,12 +3384,20 @@ def main(argv: list[str] | None = None) -> int:
         try:
             client.ensure_auth(interactive=False)
         except BecaError as exc:
-            if exc.code != "SETUP_REQUIRED" or not sys.stdin.isatty():
+            if exc.code != "SETUP_REQUIRED":
                 raise
+            if not sys.stdin.isatty():
+                raise BecaError(
+                    "BecaWork cần đăng nhập trong terminal tương tác trước khi tiếp tục yêu cầu này.",
+                    code="SETUP_REQUIRED",
+                    hint=f"Chạy chính yêu cầu hiện tại trong terminal tương tác: {cli_command_text(command_arguments)}. Không chạy setup riêng và không dùng browser hoặc Computer Use.",
+                    exit_code=2,
+                    required_action="OPEN_INTERACTIVE_TERMINAL",
+                ) from exc
             print("BecaWork chưa được thiết lập. Bắt đầu onboarding read-only...")
             command_setup(
                 client,
-                argparse.Namespace(username=None, no_store=False, json=False),
+                argparse.Namespace(username=None, json=False),
             )
     return args.func(client, args)
 

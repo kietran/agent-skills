@@ -8,7 +8,7 @@ Send this message to Codex:
 
 > Install this skill from https://github.com/kietran/agent-skills/tree/main/skills/beca-logtime, then set up and verify BecaWork without changing any data.
 
-Requirements: Codex and Python 3.11 or newer. Secure password storage is optional through Python `keyring`; the skill never stores passwords in its JSON config.
+Requirements: Codex and Python 3.11 or newer. First-time setup installs `keyring` into a skill-managed directory and stores the validated password in the operating-system credential store; the skill never stores passwords in its JSON config.
 
 After installation, you can simply ask:
 
