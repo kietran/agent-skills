@@ -391,7 +391,9 @@ class BecaLogtimeTests(unittest.TestCase):
             def ensure_auth(self, interactive=False):
                 raise beca_logtime.BecaError("missing", code="SETUP_REQUIRED")
 
-        with patch.object(beca_logtime, "BecaClient", MissingAuthClient), patch.object(
+        with patch.object(beca_logtime.sys, "platform", "win32"), patch.object(
+            beca_logtime, "BecaClient", MissingAuthClient
+        ), patch.object(
             beca_logtime.sys.stdin, "isatty", return_value=False
         ):
             with self.assertRaises(beca_logtime.BecaError) as raised:
