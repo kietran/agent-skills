@@ -58,6 +58,30 @@ class BecaLogtimeTests(unittest.TestCase):
         ).as_dict()
         self.assertEqual(error["error"]["code"], "AUTH_INVALID")
         self.assertFalse(error["error"]["dataChanged"])
+        self.assertIsNone(error["error"]["requiredAction"])
+
+    def test_setup_required_returns_terminal_action_and_exact_command(self) -> None:
+        client = beca_logtime.BecaClient()
+        with patch.object(beca_logtime, "load_config", return_value={}), patch.object(
+            beca_logtime, "secret_tool_lookup", return_value=None
+        ), patch.object(beca_logtime, "kwallet_lookup", return_value=None), patch.object(
+            beca_logtime.sys.stdin, "isatty", return_value=False
+        ):
+            with self.assertRaises(beca_logtime.BecaError) as raised:
+                client.ensure_auth(interactive=False)
+        error = raised.exception
+        self.assertEqual(error.code, "SETUP_REQUIRED")
+        self.assertEqual(error.required_action, "OPEN_INTERACTIVE_TERMINAL")
+        self.assertIn("beca_logtime.py", error.hint)
+        self.assertIn("Không dùng browser hoặc Computer Use", error.hint)
+
+    def test_windows_setup_command_quotes_python_path(self) -> None:
+        with patch.object(beca_logtime.sys, "platform", "win32"), patch.object(
+            beca_logtime.sys, "executable", r"C:\Program Files\Python311\python.exe"
+        ):
+            command = beca_logtime.setup_command_text()
+        self.assertIn('"C:\\Program Files\\Python311\\python.exe"', command)
+        self.assertTrue(command.endswith("setup"))
 
     def test_form_parser_scopes_inputs_to_each_form(self) -> None:
         forms = beca_logtime.parse_forms(

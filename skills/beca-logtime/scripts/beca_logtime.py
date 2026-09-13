@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
 import unicodedata
@@ -49,12 +50,14 @@ class BecaError(RuntimeError):
         hint: str | None = None,
         data_changed: bool = False,
         exit_code: int = 1,
+        required_action: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.hint = hint
         self.data_changed = data_changed
         self.exit_code = exit_code
+        self.required_action = required_action
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +67,7 @@ class BecaError(RuntimeError):
                 "message": str(self),
                 "hint": self.hint,
                 "dataChanged": self.data_changed,
+                "requiredAction": self.required_action,
             },
         }
 
@@ -374,6 +378,13 @@ def setup_config(username: str, backend: str) -> dict[str, Any]:
     }
 
 
+def setup_command_text() -> str:
+    arguments = [sys.executable, str(Path(__file__).resolve()), "setup"]
+    if sys.platform.startswith("win"):
+        return subprocess.list2cmdline(arguments)
+    return shlex.join(arguments)
+
+
 @dataclass
 class PreparedLogtime:
     form_id: str
@@ -469,8 +480,9 @@ class BecaClient:
                 raise BecaError(
                     "BecaWork chưa được thiết lập trên máy này.",
                     code="SETUP_REQUIRED",
-                    hint="Chạy setup trong terminal tương tác.",
+                    hint=f"Mở terminal tương tác và chạy: {setup_command_text()}. Không dùng browser hoặc Computer Use.",
                     exit_code=2,
+                    required_action="OPEN_INTERACTIVE_TERMINAL",
                 )
             username = input("BecaWork username: ")
 
@@ -492,8 +504,9 @@ class BecaClient:
                 raise BecaError(
                     "Không tìm thấy credential BecaWork cho tài khoản đã cấu hình.",
                     code="SETUP_REQUIRED",
-                    hint="Chạy setup trong terminal tương tác để đăng nhập lại.",
+                    hint=f"Mở terminal tương tác và chạy: {setup_command_text()}. Không dùng browser hoặc Computer Use.",
                     exit_code=2,
+                    required_action="OPEN_INTERACTIVE_TERMINAL",
                 )
             password = getpass.getpass("BecaWork password: ")
             self.auth_source = "interactive"
@@ -2616,8 +2629,9 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
             raise BecaError(
                 "Setup cần terminal tương tác để nhập tài khoản.",
                 code="SETUP_REQUIRES_TTY",
-                hint="Mở terminal rồi chạy setup, hoặc truyền --username.",
+                hint=f"Mở terminal tương tác và chạy: {setup_command_text()}. Không dùng browser hoặc Computer Use.",
                 exit_code=2,
+                required_action="OPEN_INTERACTIVE_TERMINAL",
             )
         username = input("BecaWork username: ").strip()
     if not username:
@@ -2639,8 +2653,9 @@ def command_setup(client: BecaClient, args: argparse.Namespace) -> int:
             raise BecaError(
                 "Setup cần terminal tương tác để nhập mật khẩu an toàn.",
                 code="SETUP_REQUIRES_TTY",
-                hint="Mở terminal tương tác và chạy lại setup.",
+                hint=f"Mở terminal tương tác và chạy: {setup_command_text()}. Không dùng browser hoặc Computer Use.",
                 exit_code=2,
+                required_action="OPEN_INTERACTIVE_TERMINAL",
             )
         password = getpass.getpass("BecaWork password: ")
         entered_password = True
@@ -3328,5 +3343,7 @@ if __name__ == "__main__":
             print(f"error [{exc.code}]: {exc}", file=sys.stderr)
             if exc.hint:
                 print(f"hint: {exc.hint}", file=sys.stderr)
+            if exc.required_action:
+                print(f"required action: {exc.required_action}", file=sys.stderr)
             print(f"data changed: {'yes' if exc.data_changed else 'no'}", file=sys.stderr)
         raise SystemExit(exc.exit_code)

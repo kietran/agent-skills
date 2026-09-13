@@ -1,16 +1,25 @@
 ---
 name: beca-logtime
-description: Set up, troubleshoot, and use BecaWork logtime across Windows, macOS, and Linux. Use when the user mentions BecaWork setup or login, tasks, comments, timesheets, daily logtime, existing logtime edits, task status, or percent done through work.becawork.vn.
+description: Set up, troubleshoot, and use BecaWork logtime through the bundled CLI across Windows, macOS, and Linux. Use when the user mentions BecaWork setup or login, tasks, comments, timesheets, daily logtime, existing logtime edits, task status, or percent done. Authentication must use an interactive terminal, never browser automation or Computer Use.
 ---
 
 # BecaWork Logtime
 
 Use the bundled CLI for BecaWork operations. Keep command details out of the conversation unless they help diagnose a problem; users should be able to speak naturally.
 
+## Mandatory authentication route
+
+- Always use `scripts/beca_logtime.py` for BecaWork authentication and operations. Do not use a browser, browser automation, or Computer Use as an alternative implementation of this skill.
+- When the CLI returns `SETUP_REQUIRED`, `SETUP_REQUIRES_TTY`, or `requiredAction: OPEN_INTERACTIVE_TERMINAL`, immediately start the exact setup command from the error hint in a user-visible, PTY-backed terminal and surface that terminal panel to the user. On Codex Desktop, keep the terminal session attached so the user can type username and the hidden password directly.
+- Do not stop after reporting that login is missing, and do not ask the user to discover the setup command. Continue until setup exits successfully, the user cancels, or no interactive terminal capability exists.
+- After successful setup, rerun the user's original BecaWork request through the CLI in the same turn.
+- If the host cannot expose an interactive terminal, give the user the exact command returned by the CLI and ask them to run it. Do not silently switch to browser automation.
+- For `AUTH_CHALLENGE_REQUIRED`, explain that MFA/CAPTCHA is outside v2 support. Do not bypass the skill or continue the requested BecaWork operation through Computer Use.
+
 ## Runtime and first use
 
 - Require Python 3.11 or newer. Locate the script relative to this `SKILL.md`; do not hardcode `~/.codex`. Prefer the active Python executable, then try `python3`, `python`, and Windows `py -3`.
-- For any BecaWork request, let the CLI readiness gate detect missing setup. If it returns `SETUP_REQUIRED`, open an interactive terminal and run `setup`; never ask the user to paste a password into chat.
+- For any BecaWork request, let the CLI readiness gate detect missing setup. Never ask the user to paste a password into chat.
 - `setup`, `doctor`, `whoami`, and `check-contracts` are read-only. After setup, tell the user which account was verified and suggest a few natural-language requests.
 - Read [references/onboarding.md](references/onboarding.md) for setup, credentials, platform behavior, or authentication errors. Read [references/troubleshooting.md](references/troubleshooting.md) when `doctor` or an error code reports a problem.
 

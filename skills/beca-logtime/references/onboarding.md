@@ -3,9 +3,12 @@
 ## First-use flow
 
 1. Run the requested command normally. The CLI readiness gate continues immediately when authentication is available.
-2. On `SETUP_REQUIRED`, run `setup` in an interactive terminal. Password entry must happen through the terminal's hidden prompt, never through chat or a command argument.
-3. Report the verified name/email, active-task count, API-contract result, and credential-storage result.
-4. Continue the original read or preview request. A mutating request still requires its normal preview and explicit confirmation.
+2. On `SETUP_REQUIRED`, `SETUP_REQUIRES_TTY`, or `requiredAction: OPEN_INTERACTIVE_TERMINAL`, use the exact command in the error hint. Start it in a PTY-backed, user-visible terminal and expose that terminal panel so the user can type into it.
+3. Stay with the setup flow until it succeeds or the user cancels. Do not answer with setup instructions alone when a terminal tool is available.
+4. Report the verified name/email, active-task count, API-contract result, and credential-storage result.
+5. Continue the original read or preview request through the CLI. A mutating request still requires its normal preview and explicit confirmation.
+
+Browser automation and Computer Use are not authentication fallbacks for this skill. If no interactive terminal is available, show the exact setup command and wait for the user; if MFA/CAPTCHA is detected, report the limitation without switching tools.
 
 Useful commands:
 
@@ -20,6 +23,8 @@ python beca_logtime.py version
 ```
 
 Resolve `python` and the script path for the current OS; these examples are illustrative.
+
+On Windows, prefer the absolute command emitted by the CLI, typically using the current `python.exe` or `py -3`. Do not translate the login flow into browser steps.
 
 ## Credentials
 

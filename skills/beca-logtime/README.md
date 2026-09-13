@@ -18,4 +18,6 @@ After installation, you can simply ask:
 
 On first use, the skill automatically starts read-only setup. It previews every mutation and requires explicit confirmation before changing BecaWork.
 
+Authentication always runs through a user-visible terminal so the password can be entered securely. The Agent must not substitute browser automation or Computer Use for the skill's CLI.
+
 If setup fails, ask Codex: “Kiểm tra BecaWork giúp tôi.” The `doctor` command reports Python, platform, network, credentials, login, and API-contract status without modifying data.

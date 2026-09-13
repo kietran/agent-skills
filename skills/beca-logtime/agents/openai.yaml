@@ -1,6 +1,6 @@
 interface:
   display_name: "BecaWork Logtime"
   short_description: "Set up and manage BecaWork logtime"
-  default_prompt: "Use $beca-logtime to set up BecaWork on this computer, verify the connection, and show what I can do without changing any data."
+  default_prompt: "Use $beca-logtime and its CLI to set up BecaWork, opening an interactive terminal for credentials when required; never use browser automation or Computer Use."
 policy:
   allow_implicit_invocation: true
