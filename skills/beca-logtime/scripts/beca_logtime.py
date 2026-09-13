@@ -28,7 +28,7 @@ SSO_ORIGIN = "https://sso.becawork.vn"
 USER_AGENT = "Mozilla/5.0"
 LOCAL_TIMEZONE = timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
 MIN_PYTHON = (3, 11)
-CLI_VERSION = "2.0.0"
+CLI_VERSION = "2.0.1"
 CONFIG_SCHEMA_VERSION = 1
 KEYRING_SERVICE = "beca-logtime"
 LOGIN_URL = (
