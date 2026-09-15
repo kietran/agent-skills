@@ -6,7 +6,15 @@ An Agent Skill for setting up and managing BecaWork logtime on Windows, macOS, a
 
 Send this message to Codex:
 
-> Install this skill from https://github.com/kietran/agent-skills/tree/main/skills/beca-logtime, then set up and verify BecaWork without changing any data.
+> Install this skill from https://github.com/kietran/agent-skills/tree/beca-logtime-v2/skills/beca-logtime, then set up and verify BecaWork without changing any data.
+
+## Update with Codex
+
+After the first installation, the skill remembers its canonical source. Send this message without repeating the repository URL:
+
+> Cập nhật skill `beca-logtime` lên bản mới nhất.
+
+The update stages and validates the new bundle before replacing the installed code. Existing configuration, managed Python dependencies, and operating-system credentials are outside the skill directory and must remain unchanged.
 
 Requirements: Codex and Python 3.11 or newer. First-time setup installs `keyring` into a skill-managed directory and stores the validated password in the operating-system credential store; the skill never stores passwords in its JSON config.
 

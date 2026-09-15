@@ -1,6 +1,6 @@
 ---
 name: beca-logtime
-description: Set up, troubleshoot, and use BecaWork logtime through the bundled CLI across Windows, macOS, and Linux. Use when the user mentions BecaWork setup or login, tasks, comments, timesheets, daily logtime, existing logtime edits, task status, or percent done. Authentication must use an interactive terminal, never browser automation or Computer Use.
+description: Update, set up, troubleshoot, and use BecaWork logtime through the bundled CLI across Windows, macOS, and Linux. Use when the user asks to update beca-logtime or mentions BecaWork setup or login, tasks, comments, timesheets, daily logtime, existing logtime edits, task status, or percent done. Authentication must use an interactive terminal, never browser automation or Computer Use.
 ---
 
 # BecaWork Logtime
@@ -25,6 +25,10 @@ Use the bundled CLI for BecaWork operations. Keep command details out of the con
 - First-time onboarding automatically installs the supported `keyring` dependency into the skill's managed config directory and stores the validated password in the operating-system credential store. Do not offer a session-only choice.
 - `setup`, `doctor`, `whoami`, and `check-contracts` are read-only. After setup, tell the user which account was verified and suggest a few natural-language requests.
 - Read [references/onboarding.md](references/onboarding.md) for setup, credentials, platform behavior, or authentication errors. Read [references/troubleshooting.md](references/troubleshooting.md) when `doctor` or an error code reports a problem.
+
+## Skill updates
+
+When the user asks to update `beca-logtime` to the latest version, read and follow [references/update.md](references/update.md). The request authorizes replacing this skill's installed code only; it never authorizes deleting or resetting BecaWork configuration, managed dependencies, credentials, or other user data.
 
 ## Safety
 
