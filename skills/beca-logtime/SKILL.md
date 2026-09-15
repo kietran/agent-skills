@@ -29,13 +29,14 @@ Use the bundled CLI for BecaWork operations. Keep command details out of the con
 ## Safety
 
 - Never submit or edit logtime, task status, or percent done without explicit confirmation in the current turn.
+- For a natural-language logtime request, show the current four-section description snapshot and collect missing sections before running the CLI preview. Do not hide missing sections or combine all content into `Đã thực hiện`.
 - Preview and validate the complete proposed change first. Keep logtime and task-state changes separate unless the user explicitly requests both.
 - After every mutation, verify through the corresponding read API. If saving succeeded but verification failed, report `saved: true`, `verified: false`; do not retry automatically.
 - Do not expose passwords, cookies, OIDC fields, tokens, raw callback HTML, or credential-like task-comment content.
 
 ## Workflows
 
-- For listing tasks/comments/logtimes and preparing or submitting a daily batch, read [references/logtime.md](references/logtime.md).
+- For listing tasks/comments/logtimes and preparing or submitting a daily batch, read [references/logtime.md](references/logtime.md), including its required natural-language drafting flow.
 - For editing existing logtime, status transitions, or percent done, read [references/task-state.md](references/task-state.md).
 - Read [references/api-flow.md](references/api-flow.md) before changing endpoints, payloads, form-contract handling, or debugging unexpected BecaWork responses.
 
