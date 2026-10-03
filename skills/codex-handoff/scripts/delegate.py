@@ -266,12 +266,12 @@ def main() -> int:
     start_parser = sub.add_parser("start")
     start_parser.add_argument("--repo", required=True)
     start_parser.add_argument("--spec", required=True)
-    start_parser.add_argument("--model", default="gpt-6-sol",
-                              choices=["gpt-6-sol", "gpt-6-luna"])
+    start_parser.add_argument("--model", default="gpt-6.1-sol",
+                              choices=["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"])
     efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
     start_parser.add_argument("--reasoning-effort", choices=efforts,
                               help="Reasoning effort for the Codex implementer; omit for model default")
-    start_parser.add_argument("--subagent-model", choices=["gpt-6-sol", "gpt-6-luna"],
+    start_parser.add_argument("--subagent-model", choices=["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"],
                               help="Default model if this Codex run spawns its own subagents")
     start_parser.add_argument("--subagent-reasoning-effort", choices=efforts,
                               help="Default effort if this Codex run spawns its own subagents")

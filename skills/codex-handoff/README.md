@@ -35,7 +35,7 @@ This is a view of the Codex CLI run, not a task in the Codex VS Code extension's
 The default is Codex `workspace-write`. For a specific run that the user has authorized to access host GPU devices or other resources outside the Codex sandbox, add `--full-access`:
 
 ```sh
-~/.claude/skills/codex-handoff/scripts/delegate.py start --repo /absolute/repo --spec /absolute/spec.md --model gpt-6-sol --full-access
+~/.claude/skills/codex-handoff/scripts/delegate.py start --repo /absolute/repo --spec /absolute/spec.md --model gpt-6.1-sol --full-access
 ```
 
 The helper maps this to Codex's `--dangerously-bypass-approvals-and-sandbox` flag. It removes Codex's sandbox and approval prompts for that invocation, including on `resume` when the flag is provided there. It does not change the global Codex configuration, and the default remains `workspace-write`. If the GPU is still unavailable, check that the server or container exposes the device to the process; bypassing Codex's sandbox cannot create a missing device.
@@ -47,8 +47,10 @@ Choose the Codex implementer's effort per run with `--reasoning-effort`. Omit it
 ```sh
 ~/.claude/skills/codex-handoff/scripts/delegate.py start \
   --repo /absolute/repo --spec /absolute/spec.md \
-  --model gpt-6-sol --reasoning-effort high \
+  --model gpt-6.1-sol --reasoning-effort high \
   --subagent-model gpt-6-luna --subagent-reasoning-effort medium
 ```
 
 Supported values are `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` where the selected model supports them. GPT-6 Luna does not support `ultra`. Pass the chosen options again when using `--resume`; each invocation records them in its `status.json` and transcript. The helper forwards them as Codex configuration overrides, so it does not change your global Codex defaults.
+
+The default implementer model is `gpt-6.1-sol`. Both `--model` and `--subagent-model` accept `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna`. GPT-6.1 Sol supports reasoning efforts from `low` through `ultra`.
