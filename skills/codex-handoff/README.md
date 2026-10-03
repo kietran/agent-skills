@@ -35,7 +35,7 @@ This is a view of the Codex CLI run, not a task in the Codex VS Code extension's
 The default is Codex `workspace-write`. For a specific run that the user has authorized to access host GPU devices or other resources outside the Codex sandbox, add `--full-access`:
 
 ```sh
-~/.claude/skills/codex-handoff/scripts/delegate.py start --repo /absolute/repo --spec /absolute/spec.md --model gpt-6.1-sol --full-access
+~/.claude/skills/codex-handoff/scripts/delegate.py start --repo /absolute/repo --spec /absolute/spec.md --full-access
 ```
 
 The helper maps this to Codex's `--dangerously-bypass-approvals-and-sandbox` flag. It removes Codex's sandbox and approval prompts for that invocation, including on `resume` when the flag is provided there. It does not change the global Codex configuration, and the default remains `workspace-write`. If the GPU is still unavailable, check that the server or container exposes the device to the process; bypassing Codex's sandbox cannot create a missing device.
@@ -47,10 +47,10 @@ Choose the Codex implementer's effort per run with `--reasoning-effort`. Omit it
 ```sh
 ~/.claude/skills/codex-handoff/scripts/delegate.py start \
   --repo /absolute/repo --spec /absolute/spec.md \
-  --model gpt-6.1-sol --reasoning-effort high \
-  --subagent-model gpt-6-luna --subagent-reasoning-effort medium
+  --reasoning-effort high \
+  --subagent-model <model-id> --subagent-reasoning-effort medium
 ```
 
-Supported values are `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` where the selected model supports them. GPT-6 Luna does not support `ultra`. Pass the chosen options again when using `--resume`; each invocation records them in its `status.json` and transcript. The helper forwards them as Codex configuration overrides, so it does not change your global Codex defaults.
+Supported values are `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` where the selected model supports them. Codex validates compatibility with the selected model. Pass the chosen options again when using `--resume`; each invocation records them in its `status.json` and transcript. The helper forwards them as Codex configuration overrides, so it does not change your global Codex defaults.
 
-The default implementer model is `gpt-6.1-sol`. Both `--model` and `--subagent-model` accept `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna`. GPT-6.1 Sol supports reasoning efforts from `low` through `ultra`.
+Omit `--model` to use Codex's configured model. To select a model for one run, pass `--model <model-id>`. Both `--model` and `--subagent-model` accept arbitrary model IDs, so new models do not require updating this skill. The installed Codex CLI and account must support the selected model. Omitted subagent options preserve Codex's configured behavior. On resume, omit `--model` to let Codex resolve its configuration/session defaults, or repeat an explicit model selection to override them.

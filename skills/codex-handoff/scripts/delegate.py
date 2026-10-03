@@ -48,11 +48,6 @@ def start(args: argparse.Namespace) -> int:
         raise SystemExit("--repo must be inside a Git repository")
     if not shutil.which("codex"):
         raise SystemExit("Codex CLI is not installed or is not on PATH")
-    if args.model == "gpt-6-luna" and args.reasoning_effort == "ultra":
-        raise SystemExit("gpt-6-luna does not support ultra reasoning effort")
-    child_model = args.subagent_model or args.model
-    if child_model == "gpt-6-luna" and args.subagent_reasoning_effort == "ultra":
-        raise SystemExit("gpt-6-luna subagents do not support ultra reasoning effort")
 
     history = repo / ".codex-handoff"
     runs = history / "runs"
@@ -79,7 +74,7 @@ def start(args: argparse.Namespace) -> int:
     (run_dir / "progress.log").write_text("Codex is starting...\n", encoding="utf-8")
     (run_dir / "transcript.md").write_text(
         "# Codex session\n\n**Repository:** `" + str(repo) + "`  \n"
-        "**Model:** `" + args.model + "`  \n"
+        "**Model:** `" + str(args.model or "Codex configured default") + "`  \n"
         "**Reasoning effort:** `" + str(args.reasoning_effort or "model default") + "`  \n"
         "**Spawned subagent model:** `" + str(args.subagent_model or "inherit") + "`  \n"
         "**Spawned subagent effort:** `" + str(args.subagent_reasoning_effort or "inherit") + "`  \n"
@@ -157,7 +152,7 @@ def effort_overrides(status: dict) -> list[str]:
         ("agents.default_subagent_reasoning_effort", status.get("subagent_reasoning_effort")),
     ):
         if value:
-            options.extend(["-c", f'{key}="{value}"'])
+            options.extend(["-c", f"{key}={json.dumps(value)}"])
     return options
 
 
@@ -170,7 +165,9 @@ def worker(args: argparse.Namespace) -> int:
     thread_id = status.get("thread_id")
     full_access = status.get("sandbox_mode") == "danger-full-access"
     if thread_id:
-        command = ["codex", "exec", "resume", "--json", "-m", status["model"]]
+        command = ["codex", "exec", "resume", "--json"]
+        if status.get("model"):
+            command.extend(["-m", status["model"]])
         command.extend(effort_overrides(status))
         if full_access:
             command.append("--dangerously-bypass-approvals-and-sandbox")
@@ -178,7 +175,9 @@ def worker(args: argparse.Namespace) -> int:
             command.extend(["-c", 'sandbox_mode="workspace-write"'])
         command.extend([thread_id, "-"])
     else:
-        command = ["codex", "exec", "-C", str(repo), "-m", status["model"], "--json"]
+        command = ["codex", "exec", "-C", str(repo), "--json"]
+        if status.get("model"):
+            command.extend(["-m", status["model"]])
         command.extend(effort_overrides(status))
         if full_access:
             command.append("--dangerously-bypass-approvals-and-sandbox")
@@ -190,7 +189,7 @@ def worker(args: argparse.Namespace) -> int:
         with (run_dir / "events.jsonl").open("w", encoding="utf-8") as raw, \
              (run_dir / "progress.log").open("a", encoding="utf-8") as progress, \
              (run_dir / "transcript.md").open("a", encoding="utf-8") as transcript:
-            progress.write("Model: " + status["model"]
+            progress.write("Model: " + str(status.get("model") or "Codex configured default")
                            + "\nReasoning effort: " + str(status.get("reasoning_effort") or "model default")
                            + "\nSpawned subagent effort: " + str(status.get("subagent_reasoning_effort") or "inherit")
                            + "\nRepository: " + str(repo)
@@ -266,12 +265,12 @@ def main() -> int:
     start_parser = sub.add_parser("start")
     start_parser.add_argument("--repo", required=True)
     start_parser.add_argument("--spec", required=True)
-    start_parser.add_argument("--model", default="gpt-6.1-sol",
-                              choices=["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"])
+    start_parser.add_argument("--model",
+                              help="Model ID passed to Codex; omit to use Codex configuration")
     efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
     start_parser.add_argument("--reasoning-effort", choices=efforts,
                               help="Reasoning effort for the Codex implementer; omit for model default")
-    start_parser.add_argument("--subagent-model", choices=["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"],
+    start_parser.add_argument("--subagent-model",
                               help="Default model if this Codex run spawns its own subagents")
     start_parser.add_argument("--subagent-reasoning-effort", choices=efforts,
                               help="Default effort if this Codex run spawns its own subagents")
